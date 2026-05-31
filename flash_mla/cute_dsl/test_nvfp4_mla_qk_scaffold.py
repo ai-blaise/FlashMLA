@@ -33,6 +33,84 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass.cute.runtime import make_ptr
+
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+# Mirror of the tutorial helper at
+# /home/spencergarnets/work/references/cutlass/examples/python/CuTeDSL/cute/blackwell/tutorial/tutorial_gemm/utils.py:76
+# Convert a flat (mn, sf_k, l) e4m3 SF tensor to the
+# (32, 4, rest_m, 4, rest_k, l) blocked layout the MXF4NVF4 atom expects.
+@cute.jit
+def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
+    sf_ref_ptr: cute.Pointer,
+    sf_mma_ptr: cute.Pointer,
+    mn: int,
+    sf_k: int,
+    l: int,
+    mma_shape: tuple,
+):
+    mma_permute_order = (3, 4, 1, 5, 2, 0)
+    permuted_shape = tuple(mma_shape[i] for i in mma_permute_order)
+    cute_layout = cute.make_ordered_layout(permuted_shape, order=(2, 1, 4, 0, 3, 5))
+
+    sf_ref_tensor = cute.make_tensor(
+        sf_ref_ptr, cute.make_layout((mn, sf_k, l), stride=(sf_k, 1, mn * sf_k))
+    )
+    sf_mma_tensor = cute.make_tensor(sf_mma_ptr, cute_layout)
+
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
+    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
+    for i in cutlass.range(cute.size(sf_ref_tensor)):
+        mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
+        sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
+    pass
+
+
+def create_cute_scale_factor_tensor(l, mn, sf_k, ref_e4m3_tensor_cpu_permuted):
+    """Build the blocked SF tensor on CUDA from a (mn, sf_k, l) CPU ref tensor.
+
+    Mirrors create_cute_scale_factor_tensor in the tutorial utils.
+    Returns a CUDA tensor with shape (32, 4, ceil_div(mn,128), 4, ceil_div(sf_k,4), l).
+    """
+    atom_m = (32, 4)
+    atom_k = 4
+    mma_shape = (
+        l,
+        ceil_div(mn, atom_m[0] * atom_m[1]),
+        ceil_div(sf_k, atom_k),
+        atom_m[0],
+        atom_m[1],
+        atom_k,
+    )
+    mma_permute_order = (3, 4, 1, 5, 2, 0)
+    # Allocate the destination tensor on CPU first, then memcpy via the
+    # CuTeDSL converter (jit runs on CPU when the pointer is host-side).
+    rand_int_tensor = torch.randint(0, 2, mma_shape, dtype=torch.int8)
+    cute_e4m3_cpu = rand_int_tensor.to(dtype=torch.float8_e4m3fn)
+    cute_e4m3_cpu = cute_e4m3_cpu.permute(*mma_permute_order)
+    cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
+        make_ptr(
+            cutlass.Float8E4M3FN,
+            ref_e4m3_tensor_cpu_permuted.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=32,
+        ),
+        make_ptr(
+            cutlass.Float8E4M3FN,
+            cute_e4m3_cpu.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=32,
+        ),
+        mn,
+        sf_k,
+        l,
+        mma_shape,
+    )
+    return cute_e4m3_cpu.cuda()
 
 # MLA QK tile dims
 B_H = 64
@@ -534,50 +612,71 @@ def run_test(bench=False):
     K_packed = pack_fp4(K_fp4_dequant)
     print(f"Q_packed shape: {Q_packed.shape}, K_packed shape: {K_packed.shape}")
 
-    # SFA / SFB stored as e4m3 (one byte per block)
-    Q_sf_e4m3 = Q_sf.to(torch.float8_e4m3fn)
-    K_sf_e4m3 = K_sf.to(torch.float8_e4m3fn)
-    print(f"Q_sf shape: {Q_sf_e4m3.shape}, K_sf shape: {K_sf_e4m3.shape}")
+    # FP4 tensors: view the (m_pad, k/2) uint8 as float4_e2m1fn_x2 so each
+    # element is a packed pair. Then add the l dim and permute to (m, k//2, l)
+    # matching the tutorial layout: contiguous on K, stride m*k//2 on L.
+    l = 1
+    # Tutorial pattern: torch.randint into (l, m, k//2) uint8 then permute(1, 2, 0)
+    Q_packed_lmk = Q_packed.unsqueeze(0).contiguous()  # (1, m_pad, k/2)
+    K_packed_lnk = K_packed.unsqueeze(0).contiguous()
+    Q_f4 = Q_packed_lmk.view(torch.float4_e2m1fn_x2).permute(1, 2, 0)
+    K_f4 = K_packed_lnk.view(torch.float4_e2m1fn_x2).permute(1, 2, 0)
 
-    # Output buffer
-    C = torch.zeros(m_pad, n_pad, dtype=torch.float32, device=device)
+    # SF reference tensor on CPU in (mn, sf_k, l) layout — this is what
+    # the SF blocked-layout converter expects as input.
+    sf_k = ceil_div(k, SF_VEC)
+    # Q_sf / K_sf have shape (m_pad, sf_k); cast to e4m3 on CPU and add l=1 dim.
+    Q_sf_e4m3_ref_cpu = Q_sf.to(torch.float8_e4m3fn).cpu().unsqueeze(-1).contiguous()
+    K_sf_e4m3_ref_cpu = K_sf.to(torch.float8_e4m3fn).cpu().unsqueeze(-1).contiguous()
+    # Build the blocked SF tensors on CUDA via the cvt helper.
+    Q_sf_blocked = create_cute_scale_factor_tensor(l, m_pad, sf_k, Q_sf_e4m3_ref_cpu)
+    K_sf_blocked = create_cute_scale_factor_tensor(l, n_pad, sf_k, K_sf_e4m3_ref_cpu)
+    print(
+        f"Q_sf blocked shape: {Q_sf_blocked.shape}, stride: {Q_sf_blocked.stride()}"
+    )
 
-    # Build cute tensors using cutlass.torch helpers
-    from cutlass.cute.runtime import from_dlpack
-    # NOTE: cutlass-dsl requires (m, k, l) layout for A — add batch dim of 1
-    Q_packed = Q_packed.unsqueeze(-1)   # (m_pad, k/2, 1)
-    K_packed = K_packed.unsqueeze(-1)
-    Q_sf_e4m3 = Q_sf_e4m3.unsqueeze(-1)
-    K_sf_e4m3 = K_sf_e4m3.unsqueeze(-1)
-    C = C.unsqueeze(-1)
+    # Output buffer in (l, m, n) → permute(1, 2, 0)
+    C = torch.zeros((l, m_pad, n_pad), dtype=torch.float32, device=device).permute(
+        1, 2, 0
+    )
 
-    a_cute = from_dlpack(Q_packed, assumed_align=16)
-    b_cute = from_dlpack(K_packed, assumed_align=16)
-    sfa_cute = from_dlpack(Q_sf_e4m3, assumed_align=16)
-    sfb_cute = from_dlpack(K_sf_e4m3, assumed_align=16)
-    c_cute = from_dlpack(C, assumed_align=16)
+    # Build cute pointers via make_ptr (mirrors tutorial).
+    a_ptr = make_ptr(
+        AB_DTYPE, Q_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    b_ptr = make_ptr(
+        AB_DTYPE, K_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    c_ptr = make_ptr(
+        C_DTYPE, C.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+    )
+    sfa_ptr = make_ptr(
+        SF_DTYPE, Q_sf_blocked.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+    )
+    sfb_ptr = make_ptr(
+        SF_DTYPE, K_sf_blocked.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+    )
 
     print("Compiling kernel...")
     runner = MlaQkValidator()
-    err, stream = cuda.cuStreamCreate(0)
-    assert err == cuda.CUresult.CUDA_SUCCESS, f"cuStreamCreate failed: {err}"
+    current_stream = cutlass_torch.default_stream()
     compiled = cute.compile(
         runner,
-        a_cute.iterator, b_cute.iterator, sfa_cute.iterator, sfb_cute.iterator,
-        c_cute.iterator,
-        (m_pad, n_pad, k, 1),
-        stream,
+        a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr,
+        (m_pad, n_pad, k, l),
+        current_stream,
     )
 
     print("Launching...")
     compiled(
-        a_cute.iterator, b_cute.iterator, sfa_cute.iterator, sfb_cute.iterator,
-        c_cute.iterator, (m_pad, n_pad, k, 1), stream,
+        a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr,
+        (m_pad, n_pad, k, l), current_stream,
     )
     torch.cuda.synchronize()
 
     # Validate
-    actual = C.squeeze(-1).float()
+    # C has shape (m_pad, n_pad, l); squeeze the batch dim.
+    actual = C[..., 0].float().contiguous()
     diff = actual - ref_acc
     rms = diff.pow(2).mean().sqrt().item()
     max_abs = diff.abs().max().item()
@@ -586,10 +685,67 @@ def run_test(bench=False):
     print(f"actual range: [{actual.min().item():.3f}, {actual.max().item():.3f}]")
     print(f"Sample diff (top-left 4x4):\n{diff[:4, :4]}")
 
-    if rel_rms < 0.05:
+    passed = rel_rms < 0.05
+    if passed:
         print("\nPASS — FP4 tensor-core MMA matches reference within 5% RMS")
     else:
         print("\nFAIL — FP4 tensor-core MMA mismatch")
+
+    if bench and passed:
+        print("\n--- Benchmark: 100 iterations at MLA tile (M=128, N=128, K=512) ---")
+
+        def generate_tensors():
+            a_p = make_ptr(
+                AB_DTYPE, Q_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            )
+            b_p = make_ptr(
+                AB_DTYPE, K_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            )
+            c_p = make_ptr(
+                C_DTYPE, C.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+            )
+            sfa_p = make_ptr(
+                SF_DTYPE,
+                Q_sf_blocked.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=32,
+            )
+            sfb_p = make_ptr(
+                SF_DTYPE,
+                K_sf_blocked.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=32,
+            )
+            args = cute.testing.JitArguments(
+                a_p, b_p, sfa_p, sfb_p, c_p, (m_pad, n_pad, k, l), current_stream
+            )
+            args.add_to_scope([Q_f4, K_f4, Q_sf_blocked, K_sf_blocked, C])
+            return args
+
+        warmup_iters = 10
+        iters = 100
+        one_workspace_bytes = (
+            Q_f4.numel() * Q_f4.element_size()
+            + K_f4.numel() * K_f4.element_size()
+            + Q_sf_blocked.numel() * Q_sf_blocked.element_size()
+            + K_sf_blocked.numel() * K_sf_blocked.element_size()
+            + C.numel() * C.element_size()
+        )
+        workspace_count = cute.testing.get_workspace_count(
+            one_workspace_bytes, warmup_iters, iters
+        )
+        time_us = cute.testing.benchmark(
+            compiled,
+            workspace_generator=generate_tensors,
+            workspace_count=workspace_count,
+            stream=current_stream,
+            warmup_iterations=warmup_iters,
+            iterations=iters,
+        )
+        # 2*M*N*K FMA per gemm => 2 ops per FMA = 4*M*N*K FLOPs total
+        peta_flops = (4 * m_pad * n_pad * k * l) / (time_us * 1e-6) / 1e15
+        print(f"Latency:  {time_us:.2f} us / iter")
+        print(f"Throughput: {peta_flops:.3f} PFLOPS")
 
 
 if __name__ == "__main__":
