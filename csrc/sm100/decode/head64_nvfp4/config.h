@@ -17,6 +17,8 @@ using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using e8m0 = __nv_fp8_e8m0;
 using e4m3 = cutlass::float_e4m3_t;
+using ue4m3 = cutlass::float_ue4m3_t;   // NVFP4 scale-factor type (unsigned E4M3)
+using e2m1  = cutlass::float_e2m1_t;     // NVFP4 element type
 using namespace cute;
 
 enum NamedBarriers : uint32_t {
@@ -76,10 +78,16 @@ struct tmem_cols {
     //   0 ~ 256: output
     // 256 ~ 256 + 64*D_Q/256: Q
     // 400 ~ 464: P
+    // 464 ~ 468: SFA_Q (Q-side scale factors, 4 cols)
+    // 468 ~ 476: SFB_K (K-side scale factors, 4 cols * NUM_BUFS double-buffer)
+    // Total <= 512 hw budget.
     static constexpr int O = 0;
     static constexpr int Q = 256;
     static constexpr int Q_Tail = 256 + B_H*D_NOPE/2/128;
     static constexpr int P = 400;
+    static constexpr int SFA_Q = 464;       // Q-side scale-factor TMEM region (one-shot per batch)
+    static constexpr int SFB_K = 468;       // K-side scale-factor TMEM region (double-buffered)
+    static_assert(SFB_K + 4*NUM_BUFS <= 512, "FP4 SF TMEM regions overflow 512-col budget");
 };
 
 template<int NUM_TILES>
@@ -90,6 +98,21 @@ using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
 ), Shape<_1, _1>{}));
 
 using SmemLayoutQ_SW128 = SmemLayoutQTiles<D_Q_SW128/64>;
+
+// FP4-packed Q SMEM layout for the MXF4 atom (commit 1 scaffolding).
+// e2m1 = 4 bits, so this stores D_NOPE FP4 elems = D_NOPE/2 bytes per head row.
+// SW128 atom with e2m1 specializes via cute::upcast<sizeof_bits<e2m1>::value>.
+// Only meaningful for V32 (D_NOPE=512 is a clean multiple of 128); for MODEL1 the FP4 path
+// is not yet wired (D_NOPE=448 doesn't divide the 128-elem SW128 atom row). Commit 2 will
+// finalize the MODEL1 path.
+template<int NUM_TILES>
+using SmemLayoutQ_FP4_Tiles = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<e2m1>{},
+    Shape<Int<B_H>, Int<NUM_TILES*128>>{},   // 128 e2m1 elems per atom row = 64B SW128 atom
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+// Use V32 dim (512) so the layout is always well-defined; commit 2 specializes per MODEL_TYPE.
+using SmemLayoutQ_FP4 = SmemLayoutQ_FP4_Tiles<512/128>;
 
 using SmemLayoutOBuf = decltype(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
@@ -164,7 +187,16 @@ struct SharedMemoryPlan {
         struct {
             array_aligned<bf16, cosize_v<SmemLayoutQ_SW128>> q;
             bf16 q_sw64[B_H*D_Q_SW64];  // NOTE D_Q_SW64 may be 0 but array_aligned<bf16, 0> will have a size of 16, so we use array here. The former tensor (`q`) promises its alignment.
+            // FP4 scaffolding (commit 1: present but unused; commit 2 will activate).
+            // q_fp4 + q_scales nested in a union with `o` so they don't enlarge the qo arm.
+            // Once the FP4 path is live (commit 2), o.o_accum_buf is still populated AFTER
+            // QK has consumed q_fp4 -- matches the existing q-then-o lifetime pattern.
+            // q_fp4 sized for V32 (512 nope dim) -- MODEL1 is wired in commit 2.
             union {
+                struct {
+                    array_aligned<uint8_t, B_H*512/2> q_fp4;
+                    CUTE_ALIGNAS(16) ue4m3 q_scales[B_H][NUM_SCALES_EACH_TOKEN];
+                } fp4;
                 array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
                 array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
             } o;
@@ -203,6 +235,23 @@ using TiledMMA_P = decltype(make_tiled_mma(
 
 using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
+// Block-scaled FP4 MMA for S = Q @ K^T (NoPE path). 1-CTA SM100_MMA_MXF4_SS variant.
+// M=B_H*2=128 (dual-GEMM pack), N=B_TOPK*2=128, VS=16 (NVFP4 block size).
+// Scale-factor type is ue4m3 (unsigned E4M3, the type required by CUTLASS NVFP4 traits).
+// Commit 1 scaffolding only — the actual gemm() call lands in commit 2.
+using TiledMMA_S_NVFP4 = decltype(make_tiled_mma(
+    cute::SM100_MMA_MXF4_SS<
+        e2m1,       // A: NVFP4
+        e2m1,       // B: NVFP4
+        float,      // C: FP32
+        ue4m3,      // SF: UE4M3
+        B_H*2,      // M = 128 (dual-gemm pack)
+        B_TOPK*2,   // N = 128
+        16,         // VS = NVFP4 vector size
+        UMMA::Major::K, UMMA::Major::K
+    >{}
 ));
 
 template<typename TmaParam>

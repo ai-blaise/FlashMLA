@@ -522,6 +522,28 @@ KernelTemplate<MODEL_TYPE>
                 tP.data().get() = tmem_cols::P;
                 tO.data().get() = tmem_cols::O;
 
+                // ----- COMMIT-1 SCAFFOLDING (no semantics) -----
+                // Exercise the FP4 MMA atom alias at compile time without changing runtime
+                // behavior. Commit 2 wires the real gemm() call against this atom.
+                if constexpr (false) {
+                    TiledMMA tiled_mma_S_nvfp4 = TiledMMA_S_NVFP4{};
+                    // Touch the FP4 Q/scales SMEM to force the layout instantiation through nvcc.
+                    Tensor sQ_fp4 = make_tensor(
+                        make_smem_ptr(reinterpret_cast<e2m1*>(plan.u.qo.o.fp4.q_fp4.data())),
+                        SmemLayoutQ_FP4{}
+                    );
+                    Tensor sQ_scales = make_tensor(
+                        make_smem_ptr(&plan.u.qo.o.fp4.q_scales[0][0]),
+                        Shape<Int<B_H>, Int<NUM_SCALES_EACH_TOKEN>>{}
+                    );
+                    (void)tiled_mma_S_nvfp4;
+                    (void)sQ_fp4;
+                    (void)sQ_scales;
+                    (void)tmem_cols::SFA_Q;
+                    (void)tmem_cols::SFB_K;
+                }
+                // ----- END COMMIT-1 SCAFFOLDING -----
+
                 // Wait for UTCCP
                 plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
                 ku::tcgen05_after_thread_sync();
