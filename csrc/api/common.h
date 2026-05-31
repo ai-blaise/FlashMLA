@@ -129,8 +129,11 @@ static constexpr std::size_t get_enum_max(){
         return N;
 }
 
+// TODO: restore constexpr once GCC stdlib ships constexpr std::string (C++23).
+// For now drop constexpr so CTK 13.0 + GCC 11 stdlib accepts a runtime std::string return.
+// This function is only called from check_if_all_features_are_supported_and_abort() (error path).
 template<typename T> requires std::is_enum_v<T>
-static constexpr std::string get_dynamic_enum_name(T value){
+static std::string get_dynamic_enum_name(T value){
     constexpr std::size_t num = get_enum_max<T>();
     constexpr auto names = []<std::size_t... Is>(std::index_sequence<Is...>){
         return std::array<std::string_view, num>{ 
