@@ -45,6 +45,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
@@ -277,6 +278,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         q_rope: cute.Tensor,
         c_latent: cute.Tensor,
         c_rope: cute.Tensor,
+        *,
+        c_latent_sf: cute.Tensor,
+        q_latent_fp4: cute.Tensor,
+        q_latent_sf: cute.Tensor,
         page_table: cute.Tensor,
         o: cute.Tensor,
         lse: cute.Tensor,
@@ -306,6 +311,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type c_latent: cute.Tensor
         :param c_rope: The key RoPE tensor with shape [seq_len_k, rope_dim, batch_size]
         :type c_rope: cute.Tensor
+:param c_latent_sf: The K-latent NVFP4 scale tensor (e4m3 SF, sf_vec=16); shape matches blockscaled_utils.tile_atom_to_shape_SF of c_latent
+        :type c_latent_sf: cute.Tensor
+        :param q_latent_fp4: The Q-latent quantized to FP4 (e2m1) host-side; shape matches q_latent
+        :type q_latent_fp4: cute.Tensor
+        :param q_latent_sf: The Q-latent NVFP4 scale tensor (e4m3 SF, sf_vec=16); shape matches blockscaled_utils.tile_atom_to_shape_SF of q_latent
+        :type q_latent_sf: cute.Tensor
         :param page_table: The page table tensor with shape [page_count, batch_size]
         :type page_table: cute.Tensor
         :param o: The output tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
@@ -331,17 +342,34 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         # setup static attributes before smem/grid/tma computation
+        # NVFP4 K-latent path constants (Phase-1 scaffolding):
+        self.sf_vec_size = 16
+        self.sf_dtype = cutlass.Float8E4M3FN
+        self.ab_fp4_dtype = cutlass.Float4E2M1FN
+
         self.q_dtype = q_latent.element_type
         self.k_dtype = c_latent.element_type
         self.v_dtype = c_latent.element_type
         self.o_dtype = o.element_type
 
         # check type consistency
+        # NVFP4 K-latent relaxation: c_latent is FP4, q_latent_fp4 is FP4,
+        # q_rope/c_rope share the FP8 rope path.
         if cutlass.const_expr(
-            self.q_dtype != self.k_dtype or self.q_dtype != self.v_dtype
+            c_latent.element_type != self.ab_fp4_dtype
         ):
             raise TypeError(
-                f"Type mismatch: {self.q_dtype} != {self.k_dtype} or {self.q_dtype} != {self.v_dtype}"
+                f"c_latent must be {self.ab_fp4_dtype}, got {c_latent.element_type}"
+            )
+        if cutlass.const_expr(
+            q_latent_fp4.element_type != self.ab_fp4_dtype
+        ):
+            raise TypeError(
+                f"q_latent_fp4 must be {self.ab_fp4_dtype}, got {q_latent_fp4.element_type}"
+            )
+        if cutlass.const_expr(q_rope.element_type != c_rope.element_type):
+            raise TypeError(
+                f"q_rope/c_rope dtype mismatch: {q_rope.element_type} vs {c_rope.element_type}"
             )
         # check leading dimensions of input/output
         if cutlass.const_expr(q_latent.stride[1] != 1 or q_rope.stride[1] != 1):
