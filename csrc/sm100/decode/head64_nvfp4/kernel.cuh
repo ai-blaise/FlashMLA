@@ -783,17 +783,23 @@ KernelTemplate<MODEL_TYPE>
                         // 32 scales = 16 byte-pairs = 16 PTX insts (vs 32 + 32 float casts).
                         alignas(16) __nv_bfloat16 scales_bf16[NUM_SCALES_EACH_TOKEN];
                         {
+                            // iter 7: load 4 e4m3 bytes per iter (uint32), 2 cvts per iter.
+                            // Halves the iter count vs the uint16/1-cvt version.
                             const e4m3* src = plan.scales[rs.index_buf_idx][row_idx];
                             CUTE_UNROLL
-                            for (int pair = 0; pair < NUM_SCALES_EACH_TOKEN/2; ++pair) {
-                                uint16_t e4m3_pair = *(uint16_t*)(src + pair*2);
-                                uint32_t bf16_pair;
+                            for (int q = 0; q < NUM_SCALES_EACH_TOKEN/4; ++q) {
+                                uint32_t e4m3_quad = *(uint32_t*)(src + q*4);
+                                uint16_t e4m3_pair_lo = (uint16_t)(e4m3_quad & 0xFFFFu);
+                                uint16_t e4m3_pair_hi = (uint16_t)((e4m3_quad >> 16) & 0xFFFFu);
+                                uint32_t bf16_pair_lo, bf16_pair_hi;
                                 asm volatile(
-                                    "cvt.rn.bf16x2.e4m3x2 %0, %1;"
-                                    : "=r"(bf16_pair)
-                                    : "h"(e4m3_pair)
+                                    "cvt.rn.bf16x2.e4m3x2 %0, %2;\n\t"
+                                    "cvt.rn.bf16x2.e4m3x2 %1, %3;"
+                                    : "=r"(bf16_pair_lo), "=r"(bf16_pair_hi)
+                                    : "h"(e4m3_pair_lo), "h"(e4m3_pair_hi)
                                 );
-                                *(uint32_t*)(scales_bf16 + pair*2) = bf16_pair;
+                                *(uint32_t*)(scales_bf16 + q*4 + 0) = bf16_pair_lo;
+                                *(uint32_t*)(scales_bf16 + q*4 + 2) = bf16_pair_hi;
                             }
                         }
                         uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
