@@ -779,10 +779,22 @@ KernelTemplate<MODEL_TYPE>
                     CUTE_UNROLL
                     for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
-                        __nv_bfloat16 scales_bf16[NUM_SCALES_EACH_TOKEN];
-                        CUTE_UNROLL
-                        for (int s = 0; s < NUM_SCALES_EACH_TOKEN; ++s) {
-                            scales_bf16[s] = __float2bfloat16_rn(float(plan.scales[rs.index_buf_idx][row_idx][s]));
+                        // PTX 9.2: cvt.rn.bf16x2.e4m3x2 converts 2 e4m3 -> 2 bf16 in 1 inst.
+                        // 32 scales = 16 byte-pairs = 16 PTX insts (vs 32 + 32 float casts).
+                        alignas(16) __nv_bfloat16 scales_bf16[NUM_SCALES_EACH_TOKEN];
+                        {
+                            const e4m3* src = plan.scales[rs.index_buf_idx][row_idx];
+                            CUTE_UNROLL
+                            for (int pair = 0; pair < NUM_SCALES_EACH_TOKEN/2; ++pair) {
+                                uint16_t e4m3_pair = *(uint16_t*)(src + pair*2);
+                                uint32_t bf16_pair;
+                                asm volatile(
+                                    "cvt.rn.bf16x2.e4m3x2 %0, %1;"
+                                    : "=r"(bf16_pair)
+                                    : "h"(e4m3_pair)
+                                );
+                                *(uint32_t*)(scales_bf16 + pair*2) = bf16_pair;
+                            }
                         }
                         uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
                         CUTE_UNROLL
