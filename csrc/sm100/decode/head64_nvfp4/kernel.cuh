@@ -781,27 +781,9 @@ KernelTemplate<MODEL_TYPE>
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
                         // PTX 9.2: cvt.rn.bf16x2.e4m3x2 converts 2 e4m3 -> 2 bf16 in 1 inst.
                         // 32 scales = 16 byte-pairs = 16 PTX insts (vs 32 + 32 float casts).
-                        alignas(16) __nv_bfloat16 scales_bf16[NUM_SCALES_EACH_TOKEN];
-                        {
-                            // iter 7: load 4 e4m3 bytes per iter (uint32), 2 cvts per iter.
-                            // Halves the iter count vs the uint16/1-cvt version.
-                            const e4m3* src = plan.scales[rs.index_buf_idx][row_idx];
-                            CUTE_UNROLL
-                            for (int q = 0; q < NUM_SCALES_EACH_TOKEN/4; ++q) {
-                                uint32_t e4m3_quad = *(uint32_t*)(src + q*4);
-                                uint16_t e4m3_pair_lo = (uint16_t)(e4m3_quad & 0xFFFFu);
-                                uint16_t e4m3_pair_hi = (uint16_t)((e4m3_quad >> 16) & 0xFFFFu);
-                                uint32_t bf16_pair_lo, bf16_pair_hi;
-                                asm volatile(
-                                    "cvt.rn.bf16x2.e4m3x2 %0, %2;\n\t"
-                                    "cvt.rn.bf16x2.e4m3x2 %1, %3;"
-                                    : "=r"(bf16_pair_lo), "=r"(bf16_pair_hi)
-                                    : "h"(e4m3_pair_lo), "h"(e4m3_pair_hi)
-                                );
-                                *(uint32_t*)(scales_bf16 + q*4 + 0) = bf16_pair_lo;
-                                *(uint32_t*)(scales_bf16 + q*4 + 2) = bf16_pair_hi;
-                            }
-                        }
+                        // iter 11: LAZY scale conversion - reduces register pressure.
+                        // Scales loaded + converted inside inner col loop instead of upfront.
+                        const e4m3* scales_src = plan.scales[rs.index_buf_idx][row_idx];
                         uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
                         CUTE_UNROLL
                         for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
@@ -826,7 +808,12 @@ KernelTemplate<MODEL_TYPE>
                                 : "r"(cur_data_fp4));
                             int global_k_pos = local_col_idx * (GROUP_SIZE * 8) + idx_in_group * 8;
                             int scale_idx = global_k_pos / 16;
-                            __nv_bfloat16 scale = scales_bf16[scale_idx];
+                            // Lazy: load+convert this iter's scale on demand
+                            uint16_t scale_e4m3_pair = *(uint16_t*)(scales_src + (scale_idx & ~1));
+                            uint32_t scale_bf16_pair;
+                            asm volatile("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(scale_bf16_pair) : "h"(scale_e4m3_pair));
+                            __nv_bfloat162 scale_pair_unp = *reinterpret_cast<__nv_bfloat162*>(&scale_bf16_pair);
+                            __nv_bfloat16 scale = (scale_idx & 1) ? scale_pair_unp.y : scale_pair_unp.x;
                             __nv_bfloat162 scale_x2 = {scale, scale};
                             CUTE_UNROLL
                             for (int b = 0; b < 4; ++b) {
