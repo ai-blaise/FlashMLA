@@ -405,6 +405,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cta_group = tcgen05.CtaGroup.TWO
         # the intermediate tensor p is from smem & k-major
         p_major_mode = OperandMajorMode.K
+        # QK-latent: NVFP4 block-scaled, 2-CTA, 64-K instruction.
+        # Q-latent has been quantized to FP4 (host-side in Phase-1); K-latent is FP4
+        # with packed e4m3 SF tensor. Both operands live in SMEM.
+        qk_latent_mma_op = tcgen05.MmaMXF4NVF4Op(
+            self.sf_dtype,
+            (self.mma_qk_tiler[0], self.mma_qk_tiler[1], 64),
+            cta_group,
+            tcgen05.OperandSource.SMEM,
+        )
+        qk_tiled_mma_latent = cute.make_tiled_mma(qk_latent_mma_op)
+        # QK-rope: unchanged FP8 path on Q-rope × K-rope.
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
             self.q_major_mode,
@@ -413,6 +424,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cta_group,
             self.mma_qk_tiler[:2],
         )
+        # Both MMAs share CtaGroup.TWO → identical thr_id.shape; assert to be safe.
+        assert qk_tiled_mma_latent.thr_id.shape == qk_tiled_mma.thr_id.shape
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,
@@ -456,6 +469,32 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         kc_latent_smem_layout_staged = cute.logical_divide(
             kc_latent_smem_layout_staged, (None, None, None, self.iterations_qk_latent)
+        )
+
+        # Block scales for K-latent (B side of the NVFP4 MMA).
+        # Phase-1 leaves the K/Q FP8 SMEM staging dtypes untouched; the FP4 SMEM
+        # swap happens in Section F-G when the SMEM-side FP4 buffers are wired
+        # through. Here we only materialize the SF SMEM layouts.
+        kc_latent_sf_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+            qk_tiled_mma_latent,
+            self.mma_qk_tiler,
+            self.sf_vec_size,
+            self.iterations_qk_latent * self.load_k_stage,
+        )
+        kc_latent_sf_smem_layout_staged = cute.logical_divide(
+            kc_latent_sf_smem_layout_staged,
+            (None, None, None, self.iterations_qk_latent),
+        )
+        # Block scales for Q-latent (A side) — produced host-side in Phase-1.
+        q_latent_sf_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
+            qk_tiled_mma_latent,
+            self.mma_qk_tiler,
+            self.sf_vec_size,
+            self.iterations_qk_latent * self.load_q_stage,
+        )
+        q_latent_sf_smem_layout_staged = cute.logical_divide(
+            q_latent_sf_smem_layout_staged,
+            (None, None, None, self.iterations_qk_latent),
         )
 
         kc_latent_smem_layout_for_tma = sm100_utils.make_smem_layout(
@@ -575,6 +614,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             qk_tiled_mma,
             is_k_load=True,
         )
+        # TMA load for K-latent scale factors (B side, packed e4m3 viewed as int16).
+        # Page-table path is reused (one SF block per token group).
+        kc_sf_for_tma = cute.select(kc_latent_sf_smem_layout_staged, mode=[0])
+        tma_atom_c_latent_sf, tma_tensor_c_latent_sf = self.make_paged_tiled_tma_atom(
+            tma_load_op,
+            c_latent_sf,
+            kc_sf_for_tma,
+            (self.mma_qk_tiler[1], self.mma_qk_tiler[2]),
+            qk_tiled_mma_latent,
+            is_k_load=True,
+            internal_type=cutlass.Int16,
+        )
 
         # TMA load for c latent transpose
         vc_smem_layout = cute.select(vc_smem_layout_for_tma, mode=[0])
@@ -607,6 +658,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             * cute.size(qk_tiled_mma.thr_id.shape)
             * self.iterations_qk_latent
         )
+        kc_latent_sf_copy_size = (
+            cute.size_in_bytes(
+                self.sf_dtype,
+                cute.select(kc_latent_sf_smem_layout_staged, mode=[0, 1, 2]),
+            )
+            * cute.size(qk_tiled_mma_latent.thr_id.shape)
+            * self.iterations_qk_latent
+        )
         kc_rope_copy_size = (
             cute.size_in_bytes(
                 self.k_dtype,
@@ -625,7 +684,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
 
         self.tma_copy_q_bytes = q_latent_copy_size + q_rope_copy_size
-        self.tma_copy_kc_bytes = kc_latent_copy_size + kc_rope_copy_size
+        self.tma_copy_kc_bytes = (
+            kc_latent_copy_size + kc_latent_sf_copy_size + kc_rope_copy_size
+        )
         self.tma_copy_vc_bytes = vc_copy_size
 
         tile_sched_params, grid = self._compute_grid(
@@ -657,6 +718,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     self.k_dtype, cute.cosize(kc_latent_smem_layout_staged)
                 ],
                 1024,
+            ]
+            # NVFP4 K-latent SF (packed e4m3, viewed as int16 by the TMA).
+            smem_kc_latent_sf: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.sf_dtype, cute.cosize(kc_latent_sf_smem_layout_staged)
+                ],
+                128,
+            ]
+            # NVFP4 Q-latent SF (packed e4m3, produced host-side in Phase-1).
+            smem_q_latent_sf: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.sf_dtype, cute.cosize(q_latent_sf_smem_layout_staged)
+                ],
+                128,
             ]
 
             smem_kc_rope: cute.struct.Align[
@@ -728,6 +803,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             kc_latent_smem_layout_for_tma,
             kc_rope_smem_layout_for_tma,
             vc_smem_layout_for_tma,
+            kc_latent_sf_smem_layout_staged,
+            q_latent_sf_smem_layout_staged,
             cta_layout_vmnk,
             tile_sched_params,
             SplitKVKernelSharedStorage,
@@ -763,6 +840,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mma_tiler,
         tiled_mma: cute.TiledMma,
         is_k_load: bool,
+        internal_type=None,
     ):
         ident = cute.make_identity_layout(gmem.shape)
         g_tile = cute.composition(ident, mma_tiler)
@@ -781,12 +859,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cta_v_map = cute.select(cta_v_map, mode=[0])
         from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 
+        kwargs = {"num_multicast": 1}
+        if internal_type is not None:
+            kwargs["internal_type"] = internal_type
         res = _cute_nvgpu_ir.atom_make_non_exec_tiled_tma_load(
             gmem.value,
             smem_layout.value,
             cta_v_map,
             tma_load_op._to_ir(),
-            num_multicast=1,
+            **kwargs,
         )
         return (
             cute.CopyAtom(
@@ -829,6 +910,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         kc_latent_smem_layout_for_tma: Optional[cute.ComposedLayout],
         kc_rope_smem_layout_for_tma: Optional[cute.ComposedLayout],
         vc_smem_layout_for_tma: Optional[cute.ComposedLayout],
+        kc_latent_sf_smem_layout_staged: cute.Layout,
+        q_latent_sf_smem_layout_staged: cute.Layout,
         cta_layout_vmnk: cute.Layout,
         tile_sched_params: MLAStaticTileSchedulerParams,
         SharedStorage: cutlass.Constexpr,
@@ -993,6 +1076,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         sKC_rope_for_tma = storage.smem_kc_rope.get_tensor(
             kc_rope_smem_layout_for_tma.outer, swizzle=kc_rope_smem_layout_for_tma.inner
+        )
+        # NVFP4 SF SMEM bindings. K-latent SF is TMA-loaded (B side); Q-latent SF
+        # is staged host-side in Phase-1 (A side). Both feed the QK-latent MMA.
+        # SF layouts come from make_smem_layout_sf{a,b} which returns a plain
+        # cute.Layout (non-swizzled), so no .outer/.inner split here.
+        sKC_sf = storage.smem_kc_latent_sf.get_tensor(
+            kc_latent_sf_smem_layout_staged
+        )
+        sQ_sf = storage.smem_q_latent_sf.get_tensor(
+            q_latent_sf_smem_layout_staged
         )
         # (MMA, MMA_D, MMA_K, PIPE)
         sVC = storage.smem_vc.get_tensor(
