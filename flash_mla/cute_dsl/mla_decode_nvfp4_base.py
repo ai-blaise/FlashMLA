@@ -843,6 +843,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         self.split_kv_kernel(
             qk_tiled_mma,
+            qk_tiled_mma_latent,
             pv_tiled_mma,
             tma_atom_q_latent,
             tma_tensor_q_latent,
@@ -854,6 +855,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tma_tensor_q_rope,
             tma_atom_c_latent,
             tma_tensor_c_latent,
+            tma_atom_c_latent_sf,
+            tma_tensor_c_latent_sf,
             tma_atom_c_rope,
             tma_tensor_c_rope,
             tma_atom_c_latent_transpose,
@@ -955,6 +958,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
     def split_kv_kernel(
         self,
         tiled_mma_qk: cute.TiledMma,
+        tiled_mma_qk_latent: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tma_atom_q_latent: Optional[cute.CopyAtom],
         mQL: cute.Tensor,
@@ -966,6 +970,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mQR: cute.Tensor,
         tma_atom_c_latent: Optional[cute.CopyAtom],
         mCL: cute.Tensor,
+        tma_atom_c_latent_sf: Optional[cute.CopyAtom],
+        mCL_sf: cute.Tensor,
         tma_atom_c_rope: Optional[cute.CopyAtom],
         mKR: cute.Tensor,
         tma_atom_c_latent_transpose: Optional[cute.CopyAtom],
@@ -1236,23 +1242,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     )
                     tma_qk_params = SimpleNamespace(
                         tiled_mma_qk=tiled_mma_qk,
+                        tiled_mma_qk_latent=tiled_mma_qk_latent,
                         tma_atom_q_latent=tma_atom_q_latent,
                         tma_atom_q_latent_fp4=tma_atom_q_latent_fp4,
                         tma_atom_q_latent_sf=tma_atom_q_latent_sf,
                         tma_atom_q_rope=tma_atom_q_rope,
                         tma_atom_c_latent=tma_atom_c_latent,
+                        tma_atom_c_latent_sf=tma_atom_c_latent_sf,
                         tma_atom_c_rope=tma_atom_c_rope,
                         mQL=mQL,
                         mQL_fp4=mQL_fp4,
                         mQL_sf=mQL_sf,
                         mQR=mQR,
                         mCL=mCL,
+                        mCL_sf=mCL_sf,
                         mKR=mKR,
                         sQ=sQ,
                         sQ_fp4=sQ_fp4,
                         sQ_sf=sQ_sf,
                         sQ_rope=sQ_rope,
                         sKC=sKC_for_tma,
+                        sKC_sf=sKC_sf,
                         sKC_rope=sKC_rope_for_tma,
                     )
                     # Load tma
@@ -1364,9 +1374,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     mma_qk_params = SimpleNamespace(
                         mma_s_pipeline=mma_s_pipeline,
                         sQ=sQ,
+                        sQ_fp4=sQ_fp4,
+                        sQ_sf=sQ_sf,
                         sQ_rope=sQ_rope,
                         sKC=sKC,
+                        sKC_sf=sKC_sf,
                         sKC_rope=sKC_rope,
+                        tiled_mma_qk_latent=tiled_mma_qk_latent,
+                        q_sf_smem_layout_staged=q_latent_sf_smem_layout_staged,
+                        kc_sf_smem_layout_staged=kc_latent_sf_smem_layout_staged,
                     )
                     mma_pv_params = SimpleNamespace(
                         p_mma_pipeline=p_mma_pipeline,
@@ -1782,6 +1798,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if cta_m < self.page_size
             else gKR[None, 0, None, None]
         )
+        # K-latent SF: mirror gCL/tSgCL with the SF tile (M_sf = mma_qk_tiler[1],
+        # K_sf = mma_qk_tiler[2] // sf_vec_size). One SF block per token group.
+        gCL_sf = cute.tiled_divide(
+            qk_params.mCL_sf,
+            (page_tile_size, self.mma_qk_tiler[2] // self.sf_vec_size),
+        )
+        tSgCL_sf = (
+            gCL_sf[
+                None,
+                common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
+                None,
+                None,
+            ]
+            if cta_m < self.page_size
+            else gCL_sf[None, 0, None, None]
+        )
         # tma partition for q, k latent/rope
 
         # smem: ((atom_v, rest_v), STAGE)
@@ -1824,6 +1856,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             qk_params.sKC,
             tSgCL,
         )
+        # K-latent SF TMA partition: mirror tKCsKC / tCLgCL using the SF atom
+        # and the SF SMEM tensor. Produces tKCsKC_sf (SMEM dst) and tCLSFgCLSF
+        # (GMEM src) used in load_tma_qk_one_k_tile.
+        tKCsKC_sf, tCLSFgCLSF = cpasync.tma_partition(
+            qk_params.tma_atom_c_latent_sf,
+            0,
+            cute.make_layout(1),
+            qk_params.sKC_sf,
+            tSgCL_sf,
+        )
 
         tKCsKC_rope, tKRgKR = cpasync.tma_partition(
             qk_params.tma_atom_c_rope,
@@ -1853,12 +1895,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         qk_params.tQLgQL_sf = tQLgQL_sf
         qk_params.tQRgQR = tQRgQR
         qk_params.tCLgCL = tCLgCL
+        qk_params.tCLSFgCLSF = tCLSFgCLSF
         qk_params.tKRgKR = tKRgKR
         qk_params.tQsQ = tQsQ
         qk_params.tQsQ_fp4 = tQsQ_fp4
         qk_params.tQsQ_sf = tQsQ_sf
         qk_params.tQsQ_rope = tQsQ_rope
         qk_params.tKCsKC = tKCsKC
+        qk_params.tKCsKC_sf = tKCsKC_sf
         qk_params.tKCsKC_rope = tKCsKC_rope
 
         k_tile_count_init = k_tile_count
@@ -2042,6 +2086,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     qk_params.tKCsKC[None, k, 0, (i, load_k_producer_state.index)],
                     tma_bar_ptr=tma_bar_ptr,
                 )
+                # load k latent SF (B-side NVFP4 scale factors, e4m3 via int16 TMA)
+                cute.copy(
+                    qk_params.tma_atom_c_latent_sf,
+                    qk_params.tCLSFgCLSF[None, i, k_idx[k]],
+                    qk_params.tKCsKC_sf[None, k, 0, (i, load_k_producer_state.index)],
+                    tma_bar_ptr=tma_bar_ptr,
+                )
 
         for i in cutlass.range_constexpr(self.iterations_qk_rope):
             for k in cutlass.range_constexpr(page_per_tile):
@@ -2176,6 +2227,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tSrQ_rope = tiled_mma_qk.make_fragment_A(qk_params.sQ_rope)
         tSrKC = tiled_mma_qk.make_fragment_B(qk_params.sKC)
         tSrKC_rope = tiled_mma_qk.make_fragment_B(qk_params.sKC_rope)
+        # NVFP4 fragments for the QK-latent MMA. The K SMEM bytes are still raw
+        # FP4 (the FP8 TMA staging is unused by this MMA; the FP4-typed fragment
+        # reinterprets the same SMEM as e2m1 since make_fragment_B handles the
+        # dtype-specific atom layout).
+        tSrQ_fp4 = qk_params.tiled_mma_qk_latent.make_fragment_A(qk_params.sQ_fp4)
+        tSrKC_fp4 = qk_params.tiled_mma_qk_latent.make_fragment_B(qk_params.sKC)
         tOrP = tiled_mma_pv.make_fragment_A(pv_params.sP)
         tOrVC = tiled_mma_pv.make_fragment_B(pv_params.sVC)
 
@@ -2187,6 +2244,75 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         # use real tmem ptr for tStS
         tStS_staged = cute.make_tensor(common_params.tmem_ptr, tStS_staged_fake.layout)
+
+        # --- Section F: SF TMEM tensors (live above the FP32 accumulator) ---
+        cta_group = (
+            tcgen05.CtaGroup.TWO
+            if self.use_2cta_instrs
+            else tcgen05.CtaGroup.ONE
+        )
+        sfa_tmem_ptr = cute.recast_ptr(
+            common_params.tmem_ptr
+            + tcgen05.find_tmem_tensor_col_offset(tStS_staged[None, None, None, 0]),
+            dtype=self.sf_dtype,
+        )
+        tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
+            qk_params.tiled_mma_qk_latent,
+            self.mma_qk_tiler,
+            self.sf_vec_size,
+            cute.slice_(qk_params.q_sf_smem_layout_staged, (None, None, None, 0)),
+        )
+        tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
+
+        sfb_tmem_ptr = cute.recast_ptr(
+            common_params.tmem_ptr
+            + tcgen05.find_tmem_tensor_col_offset(tStS_staged[None, None, None, 0])
+            + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
+            dtype=self.sf_dtype,
+        )
+        tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
+            qk_params.tiled_mma_qk_latent,
+            self.mma_qk_tiler,
+            self.sf_vec_size,
+            cute.slice_(qk_params.kc_sf_smem_layout_staged, (None, None, None, 0)),
+        )
+        tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
+
+        # s2t copy atoms (SMEM -> TMEM for SF tiles; cta_group matches the MMA).
+        copy_atom_s2t = cute.make_copy_atom(
+            tcgen05.Cp4x32x128bOp(cta_group), self.sf_dtype,
+        )
+        tCsSFA_compact = cute.filter_zeros(qk_params.sQ_sf)
+        tCtSFA_compact = cute.filter_zeros(tCtSFA)
+        tiled_copy_s2t_sfa = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSFA_compact)
+        thr_copy_s2t_sfa = tiled_copy_s2t_sfa.get_slice(0)
+        tCsSFA_compact_s2t_ = thr_copy_s2t_sfa.partition_S(tCsSFA_compact)
+        tCsSFA_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
+            tiled_copy_s2t_sfa, tCsSFA_compact_s2t_
+        )
+        tCtSFA_compact_s2t = thr_copy_s2t_sfa.partition_D(tCtSFA_compact)
+
+        tCsSFB_compact = cute.filter_zeros(qk_params.sKC_sf)
+        tCtSFB_compact = cute.filter_zeros(tCtSFB)
+        tiled_copy_s2t_sfb = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSFB_compact)
+        thr_copy_s2t_sfb = tiled_copy_s2t_sfb.get_slice(0)
+        tCsSFB_compact_s2t_ = thr_copy_s2t_sfb.partition_S(tCsSFB_compact)
+        tCsSFB_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
+            tiled_copy_s2t_sfb, tCsSFB_compact_s2t_
+        )
+        tCtSFB_compact_s2t = thr_copy_s2t_sfb.partition_D(tCtSFB_compact)
+
+        # Stash on qk_params for the mma_qk inner-loop to consume.
+        qk_params.tCtSFA = tCtSFA
+        qk_params.tCtSFB = tCtSFB
+        qk_params.tCsSFA_compact_s2t = tCsSFA_compact_s2t
+        qk_params.tCtSFA_compact_s2t = tCtSFA_compact_s2t
+        qk_params.tCsSFB_compact_s2t = tCsSFB_compact_s2t
+        qk_params.tCtSFB_compact_s2t = tCtSFB_compact_s2t
+        qk_params.tiled_copy_s2t_sfa = tiled_copy_s2t_sfa
+        qk_params.tiled_copy_s2t_sfb = tiled_copy_s2t_sfb
+        # --- end Section F ---
+
         tOtO_shape = tiled_mma_pv.partition_shape_C(
             cute.select(self.mma_pv_tiler, mode=[0, 1])
         )
@@ -2208,6 +2334,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         qk_params.tSrQ_rope = tSrQ_rope
         qk_params.tSrKC = tSrKC
         qk_params.tSrKC_rope = tSrKC_rope
+        qk_params.tSrQ_fp4 = tSrQ_fp4
+        qk_params.tSrKC_fp4 = tSrKC_fp4
         qk_params.tStS_staged = tStS_staged
         pv_params.tOrP = tOrP
         pv_params.tOrVC = tOrVC
@@ -2326,24 +2454,60 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tStS = qk_params.tStS_staged[None, None, None, mma_s_producer_state.index]
 
         qk_params.mma_s_pipeline.producer_acquire(mma_s_producer_state)
-        tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, False)
         load_q_pipeline = common_params.load_q_pipeline
         load_k_pipeline = common_params.load_k_pipeline
         if cutlass.const_expr(wait_q):
             load_q_pipeline.consumer_wait(load_q_consumer_state)
         load_k_pipeline.consumer_wait(load_k_consumer_state)
+
+        # --- Section G.2: NVFP4 block-scaled QK-latent gemm ---
+        tiled_mma_qk_latent = qk_params.tiled_mma_qk_latent
+
+        # s2t copy of SF for this k-tile, once. Q-SF was staged by the Q TMA
+        # path (already in SMEM); K-SF was just loaded by load_tma_qk_one_k_tile.
+        s2t_stage_coord = (None, None, None, None, load_k_consumer_state.index)
+        cute.copy(
+            qk_params.tiled_copy_s2t_sfa,
+            qk_params.tCsSFA_compact_s2t[s2t_stage_coord],
+            qk_params.tCtSFA_compact_s2t,
+        )
+        cute.copy(
+            qk_params.tiled_copy_s2t_sfb,
+            qk_params.tCsSFB_compact_s2t[s2t_stage_coord],
+            qk_params.tCtSFB_compact_s2t,
+        )
+
+        tiled_mma_qk_latent.set(tcgen05.Field.ACCUMULATE, False)
         for q_stage in range(self.iterations_qk_latent):
             kc_stage = load_k_consumer_state.index
-            for k_block in cutlass.range_constexpr(cute.size(qk_params.tSrQ.shape[2])):
+            # MMA_INST_K = 64, MMA_TILE_K = 128 => 2 kblocks per q_stage.
+            num_kblocks = cute.size(qk_params.tSrQ_fp4.shape[2])
+            for kblock_idx in cutlass.range_constexpr(num_kblocks):
+                tiled_mma_qk_latent.set(
+                    tcgen05.Field.SFA,
+                    qk_params.tCtSFA[(None, None, kblock_idx, q_stage)].iterator,
+                )
+                tiled_mma_qk_latent.set(
+                    tcgen05.Field.SFB,
+                    qk_params.tCtSFB[
+                        (None, None, kblock_idx, (q_stage, kc_stage))
+                    ].iterator,
+                )
                 cute.gemm(
-                    tiled_mma_qk,
+                    tiled_mma_qk_latent,
                     tStS,
-                    qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
-                    qk_params.tSrKC[None, None, k_block, (q_stage, kc_stage)],
+                    qk_params.tSrQ_fp4[None, None, kblock_idx, (q_stage, 0)],
+                    qk_params.tSrKC_fp4[None, None, kblock_idx, (q_stage, kc_stage)],
                     tStS,
                 )
-                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+                tiled_mma_qk_latent.set(tcgen05.Field.ACCUMULATE, True)
+        # --- end Section G.2 ---
 
+        # FP8 rope-path gemm: accumulates onto the same tStS that latent just
+        # wrote. tiled_mma_qk and tiled_mma_qk_latent are separate MMA objects
+        # with independent ACCUMULATE state, so set ACCUMULATE=True explicitly
+        # before the first rope gemm.
+        tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
         for q_stage in range(self.iterations_qk_rope):
             kc_stage = load_k_consumer_state.index
             for k_block in cutlass.range_constexpr(
@@ -2356,7 +2520,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     qk_params.tSrKC_rope[None, None, k_block, kc_stage],
                     tStS,
                 )
-                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
         load_k_pipeline.consumer_release(load_k_consumer_state)
         load_k_consumer_state.advance()
         if cutlass.const_expr(wait_q):
