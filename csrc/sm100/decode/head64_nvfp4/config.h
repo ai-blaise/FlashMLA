@@ -11,7 +11,7 @@
 #include "defines.h"
 #include "params.h"
 
-namespace sm100::decode::head64 {
+namespace sm100::decode::head64_nvfp4 {
 
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
@@ -35,17 +35,20 @@ static constexpr int D_K = D_Q;
 static constexpr int D_V = 512;
 static constexpr int D_NOPE = MODEL_TYPE == ModelType::V32 ? 512 : 448;
 static constexpr int D_ROPE = 64;
-static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 128 : 64;
+static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 16 : 16;  // NVFP4 block size
 static constexpr bool V_HAVE_ROPE = MODEL_TYPE == ModelType::V32 ? false : true;
-static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 4 : 8;    // Padding is included
-static constexpr int TMA_K_STRIDE = MODEL_TYPE == ModelType::V32 ? D_NOPE+2*D_ROPE+4*(D_NOPE/QUANT_TILE_SIZE) : D_NOPE+2*D_ROPE;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
+static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 32 : 32;    // NVFP4 block_size=16 -> 32 scales per token for D_NOPE=512 (V32) or 28 padded to 32 (MODEL1)
+// NVFP4 V32: D_NOPE/2 (=256) packed FP4 + 2*D_ROPE (=128 BF16) + NUM_SCALES (=32 E4M3)
+// = 416 B/token. Inline layout (scales follow rope per token), matching FP8 V32 architecture.
+// MODEL1: D_NOPE/2 (=224) + 2*D_ROPE (=128) + 32 scales = 384.
+static constexpr int TMA_K_STRIDE = MODEL_TYPE == ModelType::V32 ? (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
 static_assert(D_NOPE + D_ROPE == D_Q);
 static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
 
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_BUFS = 2;
-static constexpr int NUM_INDEX_BUFS = 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
+static constexpr int NUM_INDEX_BUFS = 3;  // NVFP4: reduced from 4 to fit SMEM (32 scales/token expands SMEM)    // Number of buffers for indices (tma_coords) & is_token_valid & scales
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
 static constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
 
@@ -172,7 +175,8 @@ struct SharedMemoryPlan {
                 array_aligned<bf16, B_H*D_ROPE> rope; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
             } dequant[NUM_BUFS];
             static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not covers raw_nope
-            array_aligned<e4m3, B_H*D_NOPE> raw_nope[NUM_BUFS];  // Raw (quantized) NoPE part
+            // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope
+            array_aligned<uint8_t, B_H*D_NOPE/2> raw_nope[NUM_BUFS];  // Raw FP4-packed NoPE
         } kv;
     } u;
     union {
@@ -181,8 +185,8 @@ struct SharedMemoryPlan {
     } s_p;
     CUTE_ALIGNAS(16) float rowwise_max_buf[128];
     char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
-    int tma_coord[NUM_INDEX_BUFS][B_TOPK];
-    e8m0 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];
+    CUTE_ALIGNAS(16) int tma_coord[NUM_INDEX_BUFS][B_TOPK];
+    CUTE_ALIGNAS(16) e4m3 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];  // NVFP4 E4M3 per-block scales
     array_aligned<uint32_t, 1> tmem_start_addr;
     transac_bar_t bar_last_store_done;
     transac_bar_t bar_q_tma, bar_q_utccp;

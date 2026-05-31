@@ -6,6 +6,7 @@
 
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/decode/head64/kernel.h"
+#include "sm100/decode/head64_nvfp4/kernel.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
@@ -103,6 +104,40 @@ protected:
         DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
             sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE>(params);
         });
+    }
+};
+
+
+// NVFP4 KV variant of Head64x2 — calls head64_nvfp4 kernel twice for h_q=128
+// Layout per token: 256 FP4 nope + 32 E4M3 scales + 128 BF16 rope = 416 B (V32)
+class Decode_Sm100_Head64x2_NVFP4_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_576,
+        DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH
+    )
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {std::max(arch.num_sms / s_q, 1), 5, 64};
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
+            SparseAttnDecodeParams cur_params = params;
+            cur_params.q += start_head_idx * params.stride_q_h_q;
+            if (cur_params.attn_sink) cur_params.attn_sink += start_head_idx;
+            cur_params.lse += start_head_idx;
+            cur_params.out += start_head_idx * params.stride_o_h_q;
+            cur_params.lse_accum += start_head_idx;
+            cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
+            cur_params.h_q = 64;
+            sm100::decode::head64_nvfp4::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32>(cur_params);
+        }
     }
 };
 

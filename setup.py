@@ -102,6 +102,7 @@ ext_modules.append(
 
             # sm100 sparse decode
             "csrc/sm100/decode/head64/instantiations/v32.cu",
+            "csrc/sm100/decode/head64_nvfp4/instantiations/v32.cu",
             "csrc/sm100/decode/head64/instantiations/model1.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128_nvfp4/instantiations/phase1_decode_k512.cu",

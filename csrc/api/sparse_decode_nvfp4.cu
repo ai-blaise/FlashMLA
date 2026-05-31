@@ -63,8 +63,10 @@ sparse_attn_decode_nvfp4_interface(
     int h_kv = kv.size(2);
     int topk = indices.size(2);
 
-    constexpr int NVFP4_NOPE_ROPE_BYTES = 352;  // 224 nope + 128 rope
-    constexpr int NVFP4_SCALES_BYTES = 32;      // 28 e4m3 padded to 32
+    // For d_qk=576 (V3.2 head64x2 V32): single packed kv = 256 nope + 32 scales + 128 rope = 416 B
+    // For d_qk=512 (MODEL1 head128): kv = 224 nope + 128 rope = 352 B; kv_scales = 32 B (separate)
+    const int NVFP4_NOPE_ROPE_BYTES = (d_qk == 576) ? 416 : 352;
+    const int NVFP4_SCALES_BYTES = 32;  // 32 e4m3 (block_size=16)
 
     bool have_topk_length = topk_length.has_value();
     bool have_attn_sink = attn_sink.has_value();
@@ -72,7 +74,7 @@ sparse_attn_decode_nvfp4_interface(
     TORCH_CHECK(b > 0 && s_q > 0 && h_q > 0);
     TORCH_CHECK(h_kv == 1, "MLA requires h_kv == 1 (got ", h_kv, ")");
     TORCH_CHECK(h_q == 128, "head128_nvfp4 requires h_q == 128 (got ", h_q, ")");
-    TORCH_CHECK(d_qk == 512, "head128_nvfp4 requires d_qk == 512; got ", d_qk);
+    TORCH_CHECK(d_qk == 512 || d_qk == 576, "NVFP4 sparse-MLA decode supports d_qk == 512 (MODEL1) or 576 (V3.2); got ", d_qk);
     TORCH_CHECK(d_v == 512, "head128_nvfp4 requires d_v == 512; got ", d_v);
     TORCH_CHECK(topk > 0);
 
@@ -99,7 +101,10 @@ sparse_attn_decode_nvfp4_interface(
 
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, NVFP4_NOPE_ROPE_BYTES);
-    KU_CHECK_SHAPE(kv_scales, num_blocks, page_block_size, h_kv, NVFP4_SCALES_BYTES);
+    if (d_qk == 512) {
+        KU_CHECK_SHAPE(kv_scales, num_blocks, page_block_size, h_kv, NVFP4_SCALES_BYTES);
+    }
+    // For d_qk=576, scales are inline in the kv buffer; kv_scales tensor is unused.
     TORCH_CHECK(kv.stride(1) == NVFP4_NOPE_ROPE_BYTES, "kv tokens must be contiguous; stride(1)=", kv.stride(1));
     TORCH_CHECK(kv_scales.stride(1) == NVFP4_SCALES_BYTES, "kv_scales tokens must be contiguous; stride(1)=", kv_scales.stride(1));
     KU_CHECK_SHAPE(indices, b, s_q, topk);
@@ -113,19 +118,24 @@ sparse_attn_decode_nvfp4_interface(
 
     std::vector<DecodeFeatures> features;
     features.push_back(DecodeFeatures::HEAD_128);
-    features.push_back(DecodeFeatures::HEAD_DIM_512);
-    features.push_back(DecodeFeatures::MODEL1_KVCACHE_FORMAT);
+    features.push_back(d_qk == 576 ? DecodeFeatures::HEAD_DIM_576 : DecodeFeatures::HEAD_DIM_512);
+    features.push_back(d_qk == 576 ? DecodeFeatures::V32_KVCACHE_FORMAT : DecodeFeatures::MODEL1_KVCACHE_FORMAT);
     if (have_attn_sink) features.push_back(DecodeFeatures::ATTN_SINK);
     if (have_topk_length) features.push_back(DecodeFeatures::TOPK_LENGTH);
 
-    DecodeImplBase* impl = new Decode_Sm100_Head128_NVFP4_Impl();
+    DecodeImplBase* impl;
+    if (d_qk == 576) {
+        impl = new Decode_Sm100_Head64x2_NVFP4_Impl();
+    } else {
+        impl = new Decode_Sm100_Head128_NVFP4_Impl();
+    }
     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
 
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, d_v,
         sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk,
-        ModelType::MODEL1,
+        (d_qk == 576) ? ModelType::V32 : ModelType::MODEL1,
 
         (bf16*)q.data_ptr(),
         (bf16*)kv.data_ptr(),
@@ -139,10 +149,10 @@ sparse_attn_decode_nvfp4_interface(
         0, 0, 0,
         nullptr, nullptr, nullptr,
 
-        // NVFP4: kv_scales buffer
-        (uint8_t*)kv_scales.data_ptr(),
-        int64_stride_to_int(kv_scales.stride(0)),
-        int64_stride_to_int(kv_scales.stride(1)),
+        // NVFP4: kv_scales buffer (only used by head128 MODEL1 path; head64 V32 path reads inline)
+        (d_qk == 576) ? nullptr : (uint8_t*)kv_scales.data_ptr(),
+        (d_qk == 576) ? 0 : int64_stride_to_int(kv_scales.stride(0)),
+        (d_qk == 576) ? 0 : int64_stride_to_int(kv_scales.stride(1)),
 
         int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)), int64_stride_to_int(q.stride(2)),
         int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),

@@ -14,7 +14,7 @@
 
 #include "config.h"
 
-namespace sm100::decode::head64 {
+namespace sm100::decode::head64_nvfp4 {
 
 template<ModelType MODEL_TYPE>
 template<typename TmaParam>
@@ -47,7 +47,7 @@ KernelTemplate<MODEL_TYPE>
             plan.bar_q_utccp.init(1);
             for (int i = 0; i < NUM_BUFS; ++i) {
                 plan.bar_rope_ready[i].init(1);
-                plan.bar_nope_ready[i].init(128); 
+                plan.bar_nope_ready[i].init(128);
                 plan.bar_raw_ready[i].init(1);
                 plan.bar_raw_free[i].init(128);
                 plan.bar_qk_done[i].init(1);
@@ -90,7 +90,7 @@ KernelTemplate<MODEL_TYPE>
         if (sched_meta.begin_req_idx >= params.b) {
             return;
         }
-        
+
         bool bar_phase_batch_rel = 0;
         #pragma unroll 1
         for (int batch_idx = sched_meta.begin_req_idx; batch_idx <= sched_meta.end_req_idx; ++batch_idx, bar_phase_batch_rel ^= 1) {
@@ -147,7 +147,7 @@ KernelTemplate<MODEL_TYPE>
         bf16* sS_base = plan.s_p.s.data() + lane_idx*8 + (warp_idx&1)*(B_H/2)*8 + (warp_idx/2)*B_H*(B_TOPK/2);
 
         float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg((float*)params.attn_sink + (idx_in_warpgroup%64)) * CUDART_L2E_F;
-        
+
         run_main_loop([&](const MainLoopArgs &args) {
             cute::tma_store_wait<0>();
             plan.bar_last_store_done.arrive();
@@ -195,7 +195,7 @@ KernelTemplate<MODEL_TYPE>
                 }
 
                 // Since dual gemm is utilized, the layout of P in register now look like:
-                // 
+                //
                 //         32      32
                 //     +-------+-------+
                 //     |       |       |
@@ -214,7 +214,7 @@ KernelTemplate<MODEL_TYPE>
                     if (!(valid_mask>>i&1))
                         p[i] = -CUDART_INF_F;
                 }
-                
+
                 // Get rowwise max of Pi
                 float cur_pi_max = -CUDART_INF_F;
                 CUTE_UNROLL
@@ -267,7 +267,7 @@ KernelTemplate<MODEL_TYPE>
 
                 // Scale O
                 if (block_idx != args.start_block_idx && should_scale_o) {
-                    float2 scale_for_old_float2 = float2 {scale_for_old, scale_for_old}; 
+                    float2 scale_for_old_float2 = float2 {scale_for_old, scale_for_old};
                     ku::tcgen05_after_thread_sync();
 
                     static constexpr int CHUNK_SIZE = 64;
@@ -289,7 +289,7 @@ KernelTemplate<MODEL_TYPE>
                     }
                     ku::tcgen05_before_thread_sync();
                 }
-                
+
                 fence_view_async_shared();
                 plan.bar_so_ready[rs.buf_idx].arrive();
 
@@ -323,7 +323,7 @@ KernelTemplate<MODEL_TYPE>
                     *gSoftmaxLseAccum = cur_lse;
                 }
             }
-        
+
             plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase);
             rs.update();
             ku::tcgen05_after_thread_sync();
@@ -552,12 +552,12 @@ KernelTemplate<MODEL_TYPE>
                         ku::utcmma_ts(tiled_mma_P, tQ_nope, sK_nope, tP, false);
                     } else {
                         // MODEL1: RoPE is the last 64 dims within the full 512 dim, which couples with the last 64 dim from the NoPE part when performing dual GEMM. i.e.
-                        // 
+                        //
                         // logical view: |0|1|2|3|4|5|6|7| (where 7 is the RoPE part)
-                        // dual gemm's view: 
+                        // dual gemm's view:
                         // |0|2|4|6|
                         // |1|3|5|7|
-                        // 
+                        //
                         // So we must wait for both the NoPE and the RoPE part, and then perform dual GEMM
                         plan.bar_rope_ready[rs.buf_idx].wait(rs.bar_phase);
                         plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
@@ -601,14 +601,14 @@ KernelTemplate<MODEL_TYPE>
                         ku::tma_gather4(
                             block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_nope : &tma_params.tensor_map_kv_nope,
                             plan.bar_raw_ready[rs.buf_idx],
-                            plan.u.kv.raw_nope[rs.buf_idx].data() + D_NOPE*row,
+                            plan.u.kv.raw_nope[rs.buf_idx].data() + (D_NOPE/2)*row,  // NVFP4 packed
                             0,
                             cur_indices,
                             (int64_t)TMA::CacheHintSm90::EVICT_LAST
                         );
                         cur_indices = nxt_cur_indices;
                     }
-                    plan.bar_raw_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_NOPE*sizeof(e4m3));
+                    plan.bar_raw_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*(D_NOPE/2)*sizeof(uint8_t));
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                     rs.update();
                 }
@@ -654,22 +654,22 @@ KernelTemplate<MODEL_TYPE>
             // Indices transformation warp
             // Responsible for generating: TMA coordinates, scale factors, and valid masks
             static_assert(B_TOPK == 64);
-            static constexpr int tma_coords_step_per_token = MODEL_TYPE == ModelType::V32 ? 656/TMA_K_STRIDE : 576/TMA_K_STRIDE;
+            static constexpr int tma_coords_step_per_token = MODEL_TYPE == ModelType::V32 ? 416/TMA_K_STRIDE : 384/TMA_K_STRIDE;
             int tma_coords_step_per_block = params.stride_kv_block / TMA_K_STRIDE; // must < 2G since k_batch_stride < 1T and TMA_K_STRIDE > 512
             int tma_coords_step_per_extra_block = params.stride_extra_kv_block / TMA_K_STRIDE;
             uint8_t* k_scales_ptr =
                 MODEL_TYPE == ModelType::V32 ?
-                (uint8_t*)params.kv + D_NOPE :
-                (uint8_t*)params.kv + params.page_block_size*(D_NOPE+2*D_ROPE);
+                (uint8_t*)params.kv + (D_NOPE/2) :
+                (uint8_t*)params.kv + params.page_block_size*((D_NOPE/2)+2*D_ROPE);
             uint8_t* extra_k_scales_ptr =
                 MODEL_TYPE == ModelType::V32 ?
-                (uint8_t*)params.extra_kv + D_NOPE :
-                (uint8_t*)params.extra_kv + params.extra_page_block_size*(D_NOPE+2*D_ROPE);
-            
+                (uint8_t*)params.extra_kv + (D_NOPE/2) :
+                (uint8_t*)params.extra_kv + params.extra_page_block_size*((D_NOPE/2)+2*D_ROPE);
+
             run_main_loop([&](const MainLoopArgs &args) {
                 int* indices = (int*)params.indices + params.stride_indices_b*args.batch_idx + params.stride_indices_s_q*s_q_idx;
                 int* extra_indices = (int*)params.extra_indices + params.stride_extra_indices_b*args.batch_idx + params.stride_extra_indices_s_q*s_q_idx;
-                
+
                 struct IsOrigBlock {};
                 struct IsExtraBlock {};
                 auto process_one_block = [&](int block_idx, auto is_extra_block_t) {
@@ -691,7 +691,7 @@ KernelTemplate<MODEL_TYPE>
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].wait(rs.index_bar_phase^1);
 
                     int tma_coords[2];
-                    e8m0 scales[2*NUM_SCALES_EACH_TOKEN];
+                    alignas(16) e4m3 scales[2*NUM_SCALES_EACH_TOKEN];
                     char valid_mask = 0;
                     CUTE_UNROLL
                     for (int i = 0; i < 2; ++i) {
@@ -700,33 +700,30 @@ KernelTemplate<MODEL_TYPE>
                         idx_in_block = (unsigned int)my_indices[i] % cur_block_size;
                         bool is_token_valid = my_indices[i] != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
                         valid_mask |= is_token_valid << i;
-                        tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
+                        tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1;
+
+                        int64_t offset;
                         if constexpr (MODEL_TYPE == ModelType::V32) {
-                            int64_t offset = is_token_valid ? block_idx*cur_k_block_stride + idx_in_block*cur_k_row_stride : 0;
-                            float4 cur_scale_fp32 = __ldg((float4*)(cur_k_scales_ptr + offset));
-                            e8m0 res[4];
-                            *(__nv_fp8x2_storage_t*)(res+0) = __nv_cvt_float2_to_e8m0x2(float2{cur_scale_fp32.x, cur_scale_fp32.y}, __NV_NOSAT, cudaRoundZero);
-                            *(__nv_fp8x2_storage_t*)(res+2) = __nv_cvt_float2_to_e8m0x2(float2{cur_scale_fp32.z, cur_scale_fp32.w}, __NV_NOSAT, cudaRoundZero);
-                            if (!is_token_valid) *(uint32_t*)res = (uint32_t)0;
-                            *(uint32_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = *(uint32_t*)(res);
+                            offset = is_token_valid ? block_idx*cur_k_block_stride + idx_in_block*cur_k_row_stride : 0;
                         } else {
-                            int64_t offset = block_idx*cur_k_block_stride + idx_in_block*8; // Each token has 7 scale factors with an extra 1B padding
-                            uint64_t scalesx8 = is_token_valid ? __ldg((uint64_t*)(cur_k_scales_ptr + offset)) : 0;
-                            *(uint64_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = scalesx8;
+                            offset = block_idx*cur_k_block_stride + idx_in_block*NUM_SCALES_EACH_TOKEN;
                         }
+                        uint4 lo = is_token_valid ? __ldg((uint4*)(cur_k_scales_ptr + offset))      : uint4{0,0,0,0};
+                        uint4 hi = is_token_valid ? __ldg((uint4*)(cur_k_scales_ptr + offset + 16)) : uint4{0,0,0,0};
+                        ((uint4*)(scales + i*NUM_SCALES_EACH_TOKEN))[0] = lo;
+                        ((uint4*)(scales + i*NUM_SCALES_EACH_TOKEN))[1] = hi;
                     }
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                    if constexpr (MODEL_TYPE == ModelType::V32) {
-                        *(uint64_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(uint64_t*)scales;
-                    } else {
-                        *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
-                    }
+                    ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[0] = ((uint4*)scales)[0];
+                    ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[1] = ((uint4*)scales)[1];
+                    ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[2] = ((uint4*)scales)[2];
+                    ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[3] = ((uint4*)scales)[3];
                     *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
                     if (lane_idx%4 == 0)
                         plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;
-                    
+
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].arrive();
                     rs.update();
                 };
@@ -754,8 +751,8 @@ KernelTemplate<MODEL_TYPE>
         Tensor nope0 = make_tensor(make_smem_ptr(plan.u.kv.dequant[0].nope.data()), SmemLayoutKTiles_SW128<D_NOPE/64>{});
         bf16* nope0_base = &nope0(group_idx, idx_in_group*8);
         bf16* nope1_base = nope0_base + (plan.u.kv.dequant[1].nope.data() - plan.u.kv.dequant[0].nope.data());
-        e4m3* raw_nope0_base = plan.u.kv.raw_nope[rs.buf_idx].data() + group_idx*D_NOPE + idx_in_group*8;
-        e4m3* raw_nope1_base = raw_nope0_base + B_H*D_NOPE;
+        uint8_t* raw_nope0_base = plan.u.kv.raw_nope[rs.buf_idx].data() + group_idx*(D_NOPE/2) + idx_in_group*4;
+        uint8_t* raw_nope1_base = raw_nope0_base + B_H*(D_NOPE/2);
 
         run_main_loop([&](const MainLoopArgs &args) {
             // plan.bar_last_store_done.wait(args.bar_phase_batch_rel); // No need to wait since the raw nope producer must wait
@@ -767,69 +764,115 @@ KernelTemplate<MODEL_TYPE>
                 plan.bar_raw_ready[rs.buf_idx].wait(rs.bar_phase);
                 plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
                 uint32_t cur_nope_base_uint_addr = cute::cast_smem_ptr_to_uint(rs.buf_idx == 0 ? nope0_base : nope1_base);
-                e4m3* raw_nope_base = rs.buf_idx == 0 ? raw_nope0_base : raw_nope1_base;
+                uint8_t* raw_nope_base = rs.buf_idx == 0 ? raw_nope0_base : raw_nope1_base;
                 auto st_128b = [&](int local_row_idx, int local_col_idx, __int128_t &data) {
-                    asm volatile ("st.weak.shared::cta.b128 [%0], %1;\n" 
-                        : 
+                    asm volatile ("st.weak.shared::cta.b128 [%0], %1;\n"
+                        :
                         : "r"(cur_nope_base_uint_addr + 2*(local_row_idx*NUM_GROUPS*64 + local_col_idx*B_TOPK*64)), "q"(data)   // 2 for sizeof(bf16)
                     );  // We have this `asm volatile` here, otherwise the compiler generates ST.E instead of STS
                 };
-                auto get_raw_fp8 = [&](int local_row_idx, int local_col_idx) -> uint64_t {
-                    return *(uint64_t*)(raw_nope_base + local_row_idx*NUM_GROUPS*D_NOPE + local_col_idx*(GROUP_SIZE*8));
+                auto get_raw_fp4 = [&](int local_row_idx, int local_col_idx) -> uint32_t {
+                    return *(uint32_t*)(raw_nope_base + local_row_idx*NUM_GROUPS*(D_NOPE/2) + local_col_idx*(GROUP_SIZE*4));
                 };
                 // The following code suffers from a 2-way bank conflict when reading from SMEM.
                 if constexpr (MODEL_TYPE == ModelType::V32) {
                     CUTE_UNROLL
                     for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
-                        bf16 scales[4];
-                        e8m0 scales_e8m0[4];
-                        *(uint32_t*)scales_e8m0 = *(uint32_t*)plan.scales[rs.index_buf_idx][row_idx];
-                        *(__nv_bfloat162_raw*)(scales+0) = __nv_cvt_e8m0x2_to_bf162raw(*(unsigned short*)(scales_e8m0+0));
-                        *(__nv_bfloat162_raw*)(scales+2) = __nv_cvt_e8m0x2_to_bf162raw(*(unsigned short*)(scales_e8m0+2));
-
-                        uint64_t cur_data_fp8x8 = get_raw_fp8(local_row_idx, 0);
+                        __nv_bfloat16 scales_bf16[NUM_SCALES_EACH_TOKEN];
                         CUTE_UNROLL
-                        for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) { 
-                            ku::nve4m3x2 data_fp8[4];
-                            ku::nvbf16x2 data_bf16[4]; 
-                            *(uint64_t*)data_fp8 = cur_data_fp8x8;
-                            if (local_col_idx+1 < COLS_PER_GROUP)
-                                cur_data_fp8x8 = get_raw_fp8(local_row_idx, local_col_idx+1);
-                            bf16 scale = scales[local_col_idx / (D_NOPE/(GROUP_SIZE*8)/4)];
+                        for (int s = 0; s < NUM_SCALES_EACH_TOKEN; ++s) {
+                            scales_bf16[s] = __float2bfloat16_rn(float(plan.scales[rs.index_buf_idx][row_idx][s]));
+                        }
+                        uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
+                        CUTE_UNROLL
+                        for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
+                            alignas(16) __nv_bfloat16 data_bf16[8];
+                            uint32_t next_data_fp4 = (local_col_idx + 1 < COLS_PER_GROUP)
+                                ? get_raw_fp4(local_row_idx, local_col_idx + 1)
+                                : 0u;
+                            uint32_t f16x2_packed[4];
+                            asm volatile(
+                                "{\n"
+                                " .reg .b8 byte0, byte1, byte2, byte3;\n"
+                                " mov.b32 {byte0, byte1, byte2, byte3}, %4;\n"
+                                " cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
+                                " cvt.rn.f16x2.e2m1x2 %1, byte1;\n"
+                                " cvt.rn.f16x2.e2m1x2 %2, byte2;\n"
+                                " cvt.rn.f16x2.e2m1x2 %3, byte3;\n"
+                                "}"
+                                : "=r"(f16x2_packed[0]),
+                                  "=r"(f16x2_packed[1]),
+                                  "=r"(f16x2_packed[2]),
+                                  "=r"(f16x2_packed[3])
+                                : "r"(cur_data_fp4));
+                            int global_k_pos = local_col_idx * (GROUP_SIZE * 8) + idx_in_group * 8;
+                            int scale_idx = global_k_pos / 16;
+                            __nv_bfloat16 scale = scales_bf16[scale_idx];
+                            __nv_bfloat162 scale_x2 = {scale, scale};
                             CUTE_UNROLL
-                            for (int i = 0; i < 4; ++i) {
-                                data_bf16[i] = fp8x2_to_bf16x2_with_scale(data_fp8[i], *(ku::nvbf16*)(&scale));
+                            for (int b = 0; b < 4; ++b) {
+                                __half2 h2 = *reinterpret_cast<__half2*>(&f16x2_packed[b]);
+                                __nv_bfloat162 bf16x2 = {
+                                    __float2bfloat16_rn(__half2float(h2.x)),
+                                    __float2bfloat16_rn(__half2float(h2.y))
+                                };
+                                __nv_bfloat162 result = __hmul2(bf16x2, scale_x2);
+                                data_bf16[b * 2 + 0] = result.x;
+                                data_bf16[b * 2 + 1] = result.y;
                             }
                             st_128b(local_row_idx, local_col_idx, *(__int128_t*)data_bf16);
+                            cur_data_fp4 = next_data_fp4;
                         }
                     }
                 } else {
                     CUTE_UNROLL
                     for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
-                        bf16 scales[8];
-                        e8m0 scales_e8m0[8];
-                        *(uint64_t*)scales_e8m0 = *(uint64_t*)plan.scales[rs.index_buf_idx][row_idx];
-                        *(__nv_bfloat162_raw*)(scales+0) = __nv_cvt_e8m0x2_to_bf162raw(*(unsigned short*)(scales_e8m0+0));
-                        *(__nv_bfloat162_raw*)(scales+2) = __nv_cvt_e8m0x2_to_bf162raw(*(unsigned short*)(scales_e8m0+2));
-                        *(__nv_bfloat162_raw*)(scales+4) = __nv_cvt_e8m0x2_to_bf162raw(*(unsigned short*)(scales_e8m0+4));
-                        *(__nv_bfloat162_raw*)(scales+6) = __nv_cvt_e8m0x2_to_bf162raw(*(unsigned short*)(scales_e8m0+6));
-
-                        uint64_t cur_data_fp8x8 = get_raw_fp8(local_row_idx, 0);
+                        __nv_bfloat16 scales_bf16[NUM_SCALES_EACH_TOKEN];
+                        CUTE_UNROLL
+                        for (int s = 0; s < NUM_SCALES_EACH_TOKEN; ++s) {
+                            scales_bf16[s] = __float2bfloat16_rn(float(plan.scales[rs.index_buf_idx][row_idx][s]));
+                        }
+                        uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
                         CUTE_UNROLL
                         for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
-                            ku::nve4m3x2 data_fp8[4];
-                            ku::nvbf16x2 data_bf16[4];
-                            *(uint64_t*)data_fp8 = cur_data_fp8x8;
-                            if (local_col_idx+1 < COLS_PER_GROUP)
-                                cur_data_fp8x8 = get_raw_fp8(local_row_idx, local_col_idx+1);
-                            bf16 scale = scales[local_col_idx];
+                            alignas(16) __nv_bfloat16 data_bf16[8];
+                            uint32_t next_data_fp4 = (local_col_idx + 1 < COLS_PER_GROUP)
+                                ? get_raw_fp4(local_row_idx, local_col_idx + 1)
+                                : 0u;
+                            uint32_t f16x2_packed[4];
+                            asm volatile(
+                                "{\n"
+                                " .reg .b8 byte0, byte1, byte2, byte3;\n"
+                                " mov.b32 {byte0, byte1, byte2, byte3}, %4;\n"
+                                " cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
+                                " cvt.rn.f16x2.e2m1x2 %1, byte1;\n"
+                                " cvt.rn.f16x2.e2m1x2 %2, byte2;\n"
+                                " cvt.rn.f16x2.e2m1x2 %3, byte3;\n"
+                                "}"
+                                : "=r"(f16x2_packed[0]),
+                                  "=r"(f16x2_packed[1]),
+                                  "=r"(f16x2_packed[2]),
+                                  "=r"(f16x2_packed[3])
+                                : "r"(cur_data_fp4));
+                            int global_k_pos = local_col_idx * (GROUP_SIZE * 8) + idx_in_group * 8;
+                            int scale_idx = global_k_pos / 16;
+                            __nv_bfloat16 scale = scales_bf16[scale_idx];
+                            __nv_bfloat162 scale_x2 = {scale, scale};
                             CUTE_UNROLL
-                            for (int i = 0; i < 4; ++i) {
-                                data_bf16[i] = fp8x2_to_bf16x2_with_scale(data_fp8[i], *(ku::nvbf16*)(&scale));
+                            for (int b = 0; b < 4; ++b) {
+                                __half2 h2 = *reinterpret_cast<__half2*>(&f16x2_packed[b]);
+                                __nv_bfloat162 bf16x2 = {
+                                    __float2bfloat16_rn(__half2float(h2.x)),
+                                    __float2bfloat16_rn(__half2float(h2.y))
+                                };
+                                __nv_bfloat162 result = __hmul2(bf16x2, scale_x2);
+                                data_bf16[b * 2 + 0] = result.x;
+                                data_bf16[b * 2 + 1] = result.y;
                             }
                             st_128b(local_row_idx, local_col_idx, *(__int128_t*)data_bf16);
+                            cur_data_fp4 = next_data_fp4;
                         }
                     }
                 }
@@ -863,7 +906,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.d_qk == D_Q);
     KU_ASSERT(params.d_v == D_V);
     if constexpr (MODEL_TYPE == ModelType::MODEL1) {
-        constexpr int BYTES_PER_TOKEN = D_NOPE + 2*D_ROPE + 8;
+        constexpr int BYTES_PER_TOKEN = (D_NOPE/2) + 2*D_ROPE + NUM_SCALES_EACH_TOKEN;
         KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
     }
 
@@ -911,9 +954,9 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
         KU_ASSERT((int64_t)k_ptr % 16 == 0, "The base address of %sk_ptr (%p) must be 16B aligned for sparse fp8 attention on sm100f", is_extra?"extra_":"", k_ptr);
         KU_ASSERT(k_batch_stride % TMA_K_STRIDE == 0, "%sk_cache.stride(0) (%ld) must be a multiple of %d. Padding might be necessary", is_extra?"extra_":"", k_batch_stride, TMA_K_STRIDE);
         CUtensorMap tensor_map_kv_nope = ku::make_tensor_map(
-            {D_NOPE/8, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
+            {(D_NOPE/2)/8, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
             {TMA_K_STRIDE},
-            {D_NOPE/8, 1},
+            {(D_NOPE/2)/8, 1},
             k_ptr,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
@@ -923,7 +966,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
             {D_ROPE, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
             {TMA_K_STRIDE},
             {K_ROPE_SW/2, 1},
-            (uint8_t*)k_ptr + (MODEL_TYPE == ModelType::V32 ? (D_NOPE+16) : D_NOPE),
+            (uint8_t*)k_ptr + (MODEL_TYPE == ModelType::V32 ? ((D_NOPE/2)+NUM_SCALES_EACH_TOKEN) : (D_NOPE/2)),
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             K_ROPE_SW == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
@@ -952,9 +995,10 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
     auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
-    static_assert(smem_size < 227*1024);
+    static_assert(smem_size < 232*1024, "NVFP4 head64_nvfp4 SMEM exceeded 232KB (B200 hw limit)");
+    static_assert(smem_size < 230*1024, "NVFP4 head64_nvfp4 SMEM > 230KB - check sizes (smem_size as size_t)");
     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    
+
     // NOTE Don't use PDL because of potential compiler bugs!
     mla_kernel<<<dim3(params.s_q, params.num_sm_parts, 1), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, tma_params);
     KU_CHECK_KERNEL_LAUNCH();
