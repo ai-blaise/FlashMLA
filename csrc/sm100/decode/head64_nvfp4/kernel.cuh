@@ -639,15 +639,62 @@ KernelTemplate<MODEL_TYPE>
                         Tensor sK_rope = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].rope.data()), SmemLayoutKTiles_DualGemm_SW64<2/2>{});
                         ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
 
-                        // QK NoPE
+                        // QK NoPE (FP4) — Phase 1 of C++ FP4 MMA path.
+                        // Replaces BF16 NoPE MMA. Reads raw FP4 K from plan.u.kv.raw_nope (skipping WG2 dequant for NoPE),
+                        // Q FP4 from plan.u.qo.o.fp4.q_fp4, scales via TMEM (Q-SF preloaded by once-before-loop block,
+                        // K-SF UTCCP'd per-block). Accumulates on RoPE's tP via ScaleOut::One.
                         plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
+                        plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
                         ku::tcgen05_after_thread_sync();
-                        Tensor tQ_nope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
-                            partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_NOPE/2>>{})
-                        );
-                        tQ_nope.data().get() = tmem_cols::Q;
-                        Tensor sK_nope = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].nope.data()), SmemLayoutKTiles_DualGemm_SW128<512/64/2>{});
-                        ku::utcmma_ts(tiled_mma_P, tQ_nope, sK_nope, tP, false);
+                        {
+                            TiledMMA tiled_mma_S_loop = TiledMMA_S_NVFP4{};
+                            Tensor sQ_fp4_loop = make_tensor(
+                                make_smem_ptr(reinterpret_cast<e2m1*>(plan.u.qo.o.fp4.q_fp4.data())),
+                                SmemLayoutQ_FP4{}
+                            );
+                            Tensor sK_fp4_loop = make_tensor(
+                                make_smem_ptr(reinterpret_cast<e2m1*>(plan.u.kv.raw_nope[rs.buf_idx].data())),
+                                SmemLayoutK_FP4{}
+                            );
+                            Tensor tCtSFA_loop = make_tensor<typename decltype(tiled_mma_S_loop)::FrgTypeSFA>(
+                                shape(SmemLayoutAtomSFA_QK{})
+                            );
+                            tCtSFA_loop.data().get() = tmem_cols::SFA_Q;
+                            Tensor tCtSFB_loop = make_tensor<typename decltype(tiled_mma_S_loop)::FrgTypeSFB>(
+                                shape(SmemLayoutAtomSFB_QK{})
+                            );
+                            tCtSFB_loop.data().get() = tmem_cols::SFB_K;
+                            Tensor tCsSFB_loop = make_tensor(
+                                make_smem_ptr(reinterpret_cast<e4m3*>(&plan.scales[rs.index_buf_idx][0][0])),
+                                SmemLayoutAtomSFB_QK{}
+                            );
+                            auto tCsSFB_compact_loop = make_tensor(tCsSFB_loop.data(), filter_zeros(tCsSFB_loop.layout()));
+                            auto tCtSFB_compact_loop = make_tensor(tCtSFB_loop.data(), filter_zeros(tCtSFB_loop.layout()));
+                            using AtomThrID_loop = typename decltype(tiled_mma_S_loop)::AtomThrID;
+                            using UtccpOp_loop = cute::conditional_t<
+                                (decltype(cute::size(AtomThrID_loop{}) == Int<2>{})::value),
+                                SM100_UTCCP_4x32dp128bit_2cta, SM100_UTCCP_4x32dp128bit_1cta>;
+                            auto tiled_copy_s2t_SFB_loop = make_utccp_copy(UtccpOp_loop{}, tCtSFB_compact_loop);
+                            auto thr_copy_s2t_SFB_loop = tiled_copy_s2t_SFB_loop.get_slice(0);
+                            auto thr_tCsSFB_s2t_loop_ = thr_copy_s2t_SFB_loop.partition_S(tCsSFB_compact_loop);
+                            auto thr_tCsSFB_s2t_loop = get_utccp_smem_desc_tensor<UtccpOp_loop>(thr_tCsSFB_s2t_loop_);
+                            auto thr_tCtSFB_s2t_loop = thr_copy_s2t_SFB_loop.partition_D(tCtSFB_compact_loop);
+                            copy(tiled_copy_s2t_SFB_loop, thr_tCsSFB_s2t_loop, thr_tCtSFB_s2t_loop);
+
+                            auto sQ_fp4_frag_loop = tiled_mma_S_loop.get_slice(_0{}).partition_fragment_A(sQ_fp4_loop);
+                            auto sK_fp4_frag_loop = tiled_mma_S_loop.get_slice(_0{}).partition_fragment_B(sK_fp4_loop);
+                            tiled_mma_S_loop.accumulate_ = UMMA::ScaleOut::One;
+                            CUTE_UNROLL
+                            for (int k = 0; k < size<2>(sQ_fp4_frag_loop); ++k) {
+                                cute::gemm(
+                                    tiled_mma_S_loop.with(tiled_mma_S_loop.accumulate_,
+                                                          tCtSFA_loop(_, _, k),
+                                                          tCtSFB_loop(_, _, k)),
+                                    sQ_fp4_frag_loop(_, _, k),
+                                    sK_fp4_frag_loop(_, _, k),
+                                    tP);
+                            }
+                        }
                     } else {
                         // MODEL1: RoPE is the last 64 dims within the full 512 dim, which couples with the last 64 dim from the NoPE part when performing dual GEMM. i.e.
                         //
