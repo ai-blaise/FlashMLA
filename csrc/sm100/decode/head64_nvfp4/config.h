@@ -77,18 +77,22 @@ struct TmaParams {
 // Tensor memory columns
 struct tmem_cols {
     //   0 ~ 256: output
-    // 256 ~ 256 + 64*D_Q/256: Q
-    // 400 ~ 464: P
-    // 464 ~ 468: SFA_Q (Q-side scale factors, 4 cols)
-    // 468 ~ 476: SFB_K (K-side scale factors, 4 cols * NUM_BUFS double-buffer)
-    // Total <= 512 hw budget.
+    // 256 ~ 256 + B_H*D_NOPE/2/128: Q (used by BF16 NoPE path — still allocated for MODEL1;
+    //                                  V32 after Phase 1 doesn't use this region since NoPE
+    //                                  reads from FP4 SMEM, but layout reserved for binary
+    //                                  compatibility across MODEL_TYPE branches).
+    // Q_Tail .. 400: BF16 RoPE Q-TMEM (still in use, RoPE stays BF16 in Phase 1)
+    // 400 ~ 464: P (S_p softmax accumulator)
+    // 464 ~ 496: SFA_Q (Q-side SF, ~32 cols — actual footprint via find_tmem_tensor_col_offset)
+    // 496 ~ 512: SFB_K (K-side SF, fits ~16 cols at the tail of TMEM)
+    // If runtime TMEM overflow surfaces, reclaim Q region for V32 via per-MODEL_TYPE specialization.
     static constexpr int O = 0;
     static constexpr int Q = 256;
     static constexpr int Q_Tail = 256 + B_H*D_NOPE/2/128;
     static constexpr int P = 400;
     static constexpr int SFA_Q = 464;       // Q-side scale-factor TMEM region (one-shot per batch)
-    static constexpr int SFB_K = 468;       // K-side scale-factor TMEM region (double-buffered)
-    static_assert(SFB_K + 4*NUM_BUFS <= 512, "FP4 SF TMEM regions overflow 512-col budget");
+    static constexpr int SFB_K = 496;       // K-side scale-factor TMEM region (moved from 468 to 496 to avoid SFA overlap)
+    static_assert(SFB_K <= 512, "SFB_K base exceeds 512-col TMEM budget");
 };
 
 template<int NUM_TILES>
