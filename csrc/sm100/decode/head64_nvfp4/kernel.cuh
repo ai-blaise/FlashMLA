@@ -537,7 +537,7 @@ KernelTemplate<MODEL_TYPE>
                 //   only for the BF16 RoPE path. The in-kernel BF16 -> FP4 quant
                 //   that populates plan.u.qo.o.fp4.q_fp4 / q_scales is deferred to
                 //   commit 3; commit 4 moves it host-side.
-                if constexpr (false) {
+                if constexpr (true) {
                     TiledMMA tiled_mma_S = TiledMMA_S_NVFP4{};
 
                     // ---- FP4 Q (SMEM) + FP4 K (raw_nope as e2m1) ----
