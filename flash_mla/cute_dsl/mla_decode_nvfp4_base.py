@@ -615,9 +615,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cta_layout_vmnk.shape,
             )
         )
-        # Q-latent SF: non-paged A-side, int16-internal-typed TMA (matches the
-        # nvfp4_gemm_0.py SFA pattern at lines 228-236).
-        q_sf_for_tma = cute.select(q_latent_sf_smem_layout_staged, mode=[0])
+        # Q-latent SF: non-paged A-side, int16-internal-typed TMA. Matches the
+        # nvfp4_gemm_1.py SFA pattern (lines 305-316): slice the staged SF
+        # layout with (None, None, None, stage_idx) so the rank-4
+        # (atom, m, k, (iter, stage)) collapses to rank-3 (atom, m, k) — the
+        # canonical TMA-atom input shape. The previous cute.select(layout,
+        # mode=[0]) returned rank 1 and tripped the make_tiled_tma_atom_A
+        # rank assertion.
+        q_sf_for_tma = cute.slice_(
+            q_latent_sf_smem_layout_staged, (None, None, None, 0)
+        )
         tma_atom_q_latent_sf, tma_tensor_q_latent_sf = (
             cute.nvgpu.make_tiled_tma_atom_A(
                 tma_load_op,
@@ -658,8 +665,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             is_k_load=True,
         )
         # TMA load for K-latent scale factors (B side, packed e4m3 viewed as int16).
-        # Page-table path is reused (one SF block per token group).
-        kc_sf_for_tma = cute.select(kc_latent_sf_smem_layout_staged, mode=[0])
+        # Page-table path is reused (one SF block per token group). Same tutorial
+        # SFB slicing pattern as Q SF above (rank-4 staged layout → rank-3).
+        kc_sf_for_tma = cute.slice_(
+            kc_latent_sf_smem_layout_staged, (None, None, None, 0)
+        )
         tma_atom_c_latent_sf, tma_tensor_c_latent_sf = self.make_paged_tiled_tma_atom(
             tma_load_op,
             c_latent_sf,
