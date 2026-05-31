@@ -547,48 +547,72 @@ KernelTemplate<MODEL_TYPE>
                     );
                     Tensor sK_fp4 = make_tensor(
                         make_smem_ptr(reinterpret_cast<e2m1*>(plan.u.kv.raw_nope[0].data())),
-                        SmemLayoutQ_FP4{}
+                        SmemLayoutK_FP4{}
                     );
 
-                    // ---- SFA / SFB TMEM fragments ----
-                    // FrgTypeSFA/B are UMMA::tmem_sf_frg specializations. We construct
-                    // them with a partition_shape_*-derived shape and set the TMEM column.
+                    // ---- SFA / SFB TMEM fragments via canonical SF SMEM layouts ----
+                    // Per CUTLASS sm100_blockscaled_mma_array_warpspecialized.hpp:841-885 pattern.
+                    // Per spec hint #6: use shape(SmemLayoutAtomSFA{}) — NOT partition_shape_A.
                     Tensor tCtSFA = make_tensor<typename decltype(tiled_mma_S)::FrgTypeSFA>(
-                        partition_shape_A(tiled_mma_S, Shape<Int<B_H*2>, Int<D_NOPE>>{})
+                        shape(SmemLayoutAtomSFA_QK{})
                     );
                     tCtSFA.data().get() = tmem_cols::SFA_Q;
                     Tensor tCtSFB = make_tensor<typename decltype(tiled_mma_S)::FrgTypeSFB>(
-                        partition_shape_B(tiled_mma_S, Shape<Int<B_TOPK*2>, Int<D_NOPE>>{})
+                        shape(SmemLayoutAtomSFB_QK{})
                     );
                     tCtSFB.data().get() = tmem_cols::SFB_K;
 
-                    // ---- SF SMEM descriptors for UTCCP ----
-                    // Q scales: [B_H, NUM_SCALES_EACH_TOKEN] e4m3 (=ue4m3 bitwise),
-                    // K scales: [B_TOPK, NUM_SCALES_EACH_TOKEN] e4m3.
-                    UMMA::SmemDescriptor sQ_sf_desc = UMMA::make_umma_desc<UMMA::Major::K>(
-                        make_tensor(
-                            make_smem_ptr(reinterpret_cast<e4m3*>(&plan.u.qo.o.fp4.q_scales[0][0])),
-                            Layout<Shape<Int<B_H>, Int<NUM_SCALES_EACH_TOKEN>>, Stride<Int<NUM_SCALES_EACH_TOKEN>, _1>>{}
-                        )
+                    // ---- SF SMEM tensors via canonical Sm1xxBlockScaledConfig layouts ----
+                    // Producer-warp (warp 7 + Q-quant warp) must write scales in this layout.
+                    Tensor tCsSFA = make_tensor(
+                        make_smem_ptr(reinterpret_cast<e4m3*>(&plan.u.qo.o.fp4.q_scales[0][0])),
+                        SmemLayoutAtomSFA_QK{}
                     );
-                    UMMA::SmemDescriptor sK_sf_desc = UMMA::make_umma_desc<UMMA::Major::K>(
-                        make_tensor(
-                            make_smem_ptr(reinterpret_cast<e4m3*>(&plan.scales[0][0][0])),
-                            Layout<Shape<Int<B_TOPK>, Int<NUM_SCALES_EACH_TOKEN>>, Stride<Int<NUM_SCALES_EACH_TOKEN>, _1>>{}
-                        )
+                    Tensor tCsSFB = make_tensor(
+                        make_smem_ptr(reinterpret_cast<e4m3*>(&plan.scales[0][0][0])),
+                        SmemLayoutAtomSFB_QK{}
                     );
 
-                    // ---- UTCCP SMEM -> TMEM ----
-                    SM100_UTCCP_4x32dp128bit_1cta::copy(sQ_sf_desc, tmem_cols::SFA_Q);
-                    SM100_UTCCP_4x32dp128bit_1cta::copy(sK_sf_desc, tmem_cols::SFB_K);
+                    // Compact filter (CUTLASS reference pattern: eliminate zero strides for UTCCP)
+                    auto tCsSFA_compact = make_tensor(tCsSFA.data(), filter_zeros(tCsSFA.layout()));
+                    auto tCtSFA_compact = make_tensor(tCtSFA.data(), filter_zeros(tCtSFA.layout()));
+                    auto tCsSFB_compact = make_tensor(tCsSFB.data(), filter_zeros(tCsSFB.layout()));
+                    auto tCtSFB_compact = make_tensor(tCtSFB.data(), filter_zeros(tCtSFB.layout()));
+
+                    // ---- UTCCP via make_utccp_copy + partition_S/D pattern ----
+                    using AtomThrID = typename decltype(tiled_mma_S)::AtomThrID;
+                    using UtccpOp = cute::conditional_t<
+                        (decltype(cute::size(AtomThrID{}) == Int<2>{})::value),
+                        SM100_UTCCP_4x32dp128bit_2cta, SM100_UTCCP_4x32dp128bit_1cta>;
+                    auto tiled_copy_s2t_SFA = make_utccp_copy(UtccpOp{}, tCtSFA_compact);
+                    auto tiled_copy_s2t_SFB = make_utccp_copy(UtccpOp{}, tCtSFB_compact);
+
+                    auto thr_copy_s2t_SFA = tiled_copy_s2t_SFA.get_slice(0);
+                    auto thr_tCsSFA_s2t_ = thr_copy_s2t_SFA.partition_S(tCsSFA_compact);
+                    auto thr_tCsSFA_s2t = get_utccp_smem_desc_tensor<UtccpOp>(thr_tCsSFA_s2t_);
+                    auto thr_tCtSFA_s2t = thr_copy_s2t_SFA.partition_D(tCtSFA_compact);
+                    auto thr_copy_s2t_SFB = tiled_copy_s2t_SFB.get_slice(0);
+                    auto thr_tCsSFB_s2t_ = thr_copy_s2t_SFB.partition_S(tCsSFB_compact);
+                    auto thr_tCsSFB_s2t = get_utccp_smem_desc_tensor<UtccpOp>(thr_tCsSFB_s2t_);
+                    auto thr_tCtSFB_s2t = thr_copy_s2t_SFB.partition_D(tCtSFB_compact);
+
+                    copy(tiled_copy_s2t_SFA, thr_tCsSFA_s2t, thr_tCtSFA_s2t);
+                    copy(tiled_copy_s2t_SFB, thr_tCsSFB_s2t, thr_tCtSFB_s2t);
 
                     // ---- The FP4 MMA call itself ----
                     auto sQ_fp4_frag = tiled_mma_S.get_slice(_0{}).partition_fragment_A(sQ_fp4);
                     auto sK_fp4_frag = tiled_mma_S.get_slice(_0{}).partition_fragment_B(sK_fp4);
-                    auto mma_cfg = tiled_mma_S.with(UMMA::ScaleOut::One, tCtSFA, tCtSFB);
+                    tiled_mma_S.accumulate_ = UMMA::ScaleOut::Zero;
                     CUTE_UNROLL
                     for (int k = 0; k < size<2>(sQ_fp4_frag); ++k) {
-                        cute::gemm(mma_cfg, sQ_fp4_frag(_, _, k), sK_fp4_frag(_, _, k), tP);
+                        cute::gemm(
+                            tiled_mma_S.with(tiled_mma_S.accumulate_,
+                                             tCtSFA(_, _, k),
+                                             tCtSFB(_, _, k)),
+                            sQ_fp4_frag(_, _, k),
+                            sK_fp4_frag(_, _, k),
+                            tP);
+                        tiled_mma_S.accumulate_ = UMMA::ScaleOut::One;
                     }
 
                     (void)tmem_cols::SFA_Q;

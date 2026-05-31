@@ -5,6 +5,7 @@
 #include <cuda_fp8.h>
 #include <cutlass/barrier.h>
 #include <cute/tensor.hpp>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
 
 #include <kerutils/kerutils.cuh>
 
@@ -99,20 +100,29 @@ using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
 
 using SmemLayoutQ_SW128 = SmemLayoutQTiles<D_Q_SW128/64>;
 
-// FP4-packed Q SMEM layout for the MXF4 atom (commit 1 scaffolding).
+// FP4-packed Q SMEM layout for the MXF4 atom (commit 3+4: SW128-swizzle Q + K).
 // e2m1 = 4 bits, so this stores D_NOPE FP4 elems = D_NOPE/2 bytes per head row.
 // SW128 atom with e2m1 specializes via cute::upcast<sizeof_bits<e2m1>::value>.
-// Only meaningful for V32 (D_NOPE=512 is a clean multiple of 128); for MODEL1 the FP4 path
-// is not yet wired (D_NOPE=448 doesn't divide the 128-elem SW128 atom row). Commit 2 will
-// finalize the MODEL1 path.
+// SW128 swizzle is required to satisfy SM100_MMA_MXF4_SS smem-descriptor canonical
+// UMMA_K stride check. SW64/INTER variants fail "Not a canonical UMMA_K Layout".
 template<int NUM_TILES>
 using SmemLayoutQ_FP4_Tiles = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<e2m1>{},
     Shape<Int<B_H>, Int<NUM_TILES*128>>{},   // 128 e2m1 elems per atom row = 64B SW128 atom
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
-// Use V32 dim (512) so the layout is always well-defined; commit 2 specializes per MODEL_TYPE.
+// Use V32 dim (512) so the layout is always well-defined.
 using SmemLayoutQ_FP4 = SmemLayoutQ_FP4_Tiles<512/128>;
+
+// FP4-packed K SMEM layout for the MXF4 atom (dual-gemm packed M=B_H*2=128).
+// Mirrors SmemLayoutKTiles_DualGemm_SW128 but for e2m1 + halved K-stride bytes.
+template<int NUM_TILES>
+using SmemLayoutK_FP4_Tiles = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<e2m1>{},
+    Shape<Int<B_H*2>, Int<NUM_TILES*128>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+using SmemLayoutK_FP4 = SmemLayoutK_FP4_Tiles<512/128>;
 
 using SmemLayoutOBuf = decltype(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
@@ -240,7 +250,6 @@ using TiledMMA_O = decltype(make_tiled_mma(
 // Block-scaled FP4 MMA for S = Q @ K^T (NoPE path). 1-CTA SM100_MMA_MXF4_SS variant.
 // M=B_H*2=128 (dual-GEMM pack), N=B_TOPK*2=128, VS=16 (NVFP4 block size).
 // Scale-factor type is ue4m3 (unsigned E4M3, the type required by CUTLASS NVFP4 traits).
-// Commit 1 scaffolding only — the actual gemm() call lands in commit 2.
 using TiledMMA_S_NVFP4 = decltype(make_tiled_mma(
     cute::SM100_MMA_MXF4_SS<
         e2m1,       // A: NVFP4
@@ -253,6 +262,17 @@ using TiledMMA_S_NVFP4 = decltype(make_tiled_mma(
         UMMA::Major::K, UMMA::Major::K
     >{}
 ));
+
+// Canonical SF SMEM layouts via Sm1xxBlockScaledConfig (commit 3+4).
+// Replaces the flat layouts that hit "Expected an MMA-SF partitioned tensor".
+// SFVecSize=16 matches NVFP4 QUANT_TILE_SIZE.
+using Sm100BlockScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+// MMA tile shape for QK NoPE GEMM: M=B_H*2=128, N=B_TOPK*2=128, K=D_NOPE=512.
+using TileShape_QK_FP4 = Shape<Int<B_H*2>, Int<B_TOPK*2>, Int<D_NOPE>>;
+using SmemLayoutAtomSFA_QK = decltype(Sm100BlockScaledConfig::deduce_smem_layoutSFA(
+    TiledMMA_S_NVFP4{}, TileShape_QK_FP4{}));
+using SmemLayoutAtomSFB_QK = decltype(Sm100BlockScaledConfig::deduce_smem_layoutSFB(
+    TiledMMA_S_NVFP4{}, TileShape_QK_FP4{}));
 
 template<typename TmaParam>
 static __device__ void
