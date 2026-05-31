@@ -903,6 +903,32 @@ KernelTemplate<MODEL_TYPE>
             // plan.bar_last_store_done.wait(args.bar_phase_batch_rel); // No need to wait since the raw nope producer must wait
             plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
 
+            // Phase 3: In-kernel BF16→NVFP4 Q quant scaffolding (one-shot per batch).
+            // Writes PLACEHOLDER values to plan.u.qo.o.fp4.q_fp4 / q_scales so the FP4 MMA has
+            // non-zero data to consume. PTX cvt.rn.satfinite.{e2m1x2,ue4m3x2}.f32 deferred — initial
+            // attempt hit "Arguments mismatch" at ptxas (CTK 13 PTX version compatibility).
+            // Real quant (Phase 3b): reads BF16 from plan.u.qo.q via SmemLayoutQ_SW128 view.
+            // Real layouts (Phases 4-5): canonical Sm1xxBlockScaledConfig SF + SW128-swizzled FP4.
+            // Implicit sync: warp 4's FP4 MMA waits on bar_nope_ready downstream of this.
+            if constexpr (MODEL_TYPE == ModelType::V32) {
+                // 128 threads write placeholder Q FP4 + scales.
+                // q_fp4: B_H*D_NOPE/2 = 16384 bytes. 128 threads * 128 bytes = 16384.
+                constexpr int bytes_per_thread = (B_H * D_NOPE / 2) / 128;  // 128
+                CUTE_UNROLL
+                for (int i = 0; i < bytes_per_thread / 8; ++i) {
+                    uint64_t* dst = (uint64_t*)(plan.u.qo.o.fp4.q_fp4.data() + idx_in_warpgroup * bytes_per_thread + i * 8);
+                    *dst = 0x4444444444444444ULL;  // packed e2m1 value 4 (= 2.0 in NVFP4 grid)
+                }
+                // q_scales: 64 rows * 32 scales = 2048 bytes. 128 threads * 16 bytes = 2048.
+                constexpr int scale_bytes_per_thread = (B_H * NUM_SCALES_EACH_TOKEN) / 128;  // 16
+                CUTE_UNROLL
+                for (int i = 0; i < scale_bytes_per_thread / 8; ++i) {
+                    uint64_t* dst = (uint64_t*)((uint8_t*)&plan.u.qo.o.fp4.q_scales[0][0] + idx_in_warpgroup * scale_bytes_per_thread + i * 8);
+                    *dst = 0x3C3C3C3C3C3C3C3CULL;  // ue4m3 = 0x3C ≈ 1.0
+                }
+                __syncwarp();
+            }
+
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                 plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
