@@ -451,6 +451,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         q_latent_smem_layout_staged = cute.logical_divide(
             q_latent_smem_layout_staged, (None, None, None, self.iterations_qk_latent)
         )
+        # FP4 (e2m1) SMEM staging for Q-latent. Built off the NVFP4 MMA so the
+        # SMEM layout matches what the MmaMXF4NVF4Op A-operand expects. The FP8
+        # `q_latent_smem_layout_staged` above is retained for Phase-1 — the
+        # Q-FP8 TMA load still runs, but its SMEM is unused by the latent MMA.
+        q_latent_fp4_smem_layout_staged = sm100_utils.make_smem_layout_a(
+            qk_tiled_mma_latent,
+            self.mma_qk_tiler,
+            self.ab_fp4_dtype,
+            (self.iterations_qk_latent * self.load_q_stage),
+        )
+        q_latent_fp4_smem_layout_staged = cute.logical_divide(
+            q_latent_fp4_smem_layout_staged,
+            (None, None, None, self.iterations_qk_latent),
+        )
         q_rope_smem_layout_staged = sm100_utils.make_smem_layout_a(
             qk_tiled_mma,
             self.mma_qk_rope_tiler,
@@ -586,6 +600,35 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             qk_tiled_mma,
             cta_layout_vmnk.shape,
         )
+        # FP4 Q latent TMA (host-side quant). The SMEM layout / MMA tiler match
+        # the NVFP4 MMA's A-operand expectations; Q SF below mirrors this.
+        q_fp4_smem_layout = cute.select(
+            q_latent_fp4_smem_layout_staged, mode=[0, 1, 2]
+        )
+        tma_atom_q_latent_fp4, tma_tensor_q_latent_fp4 = (
+            cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                q_latent_fp4,
+                q_fp4_smem_layout,
+                self.mma_qk_tiler,
+                qk_tiled_mma_latent,
+                cta_layout_vmnk.shape,
+            )
+        )
+        # Q-latent SF: non-paged A-side, int16-internal-typed TMA (matches the
+        # nvfp4_gemm_0.py SFA pattern at lines 228-236).
+        q_sf_for_tma = cute.select(q_latent_sf_smem_layout_staged, mode=[0])
+        tma_atom_q_latent_sf, tma_tensor_q_latent_sf = (
+            cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                q_latent_sf,
+                q_sf_for_tma,
+                self.mma_qk_tiler,
+                qk_tiled_mma_latent,
+                cta_layout_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+        )
         q_rope_smem_layout = cute.select(q_rope_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_q_rope, tma_tensor_q_rope = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
@@ -645,6 +688,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             * cute.size(qk_tiled_mma.thr_id.shape)
             * self.iterations_qk_latent
         )
+        # NVFP4 Q-latent FP4 + SF copy bytes (host-side quant).
+        q_latent_fp4_copy_size = (
+            cute.size_in_bytes(self.ab_fp4_dtype, q_fp4_smem_layout)
+            * cute.size(qk_tiled_mma_latent.thr_id.shape)
+            * self.iterations_qk_latent
+        )
+        q_latent_sf_copy_size = (
+            cute.size_in_bytes(
+                self.sf_dtype,
+                cute.select(q_latent_sf_smem_layout_staged, mode=[0, 1, 2]),
+            )
+            * cute.size(qk_tiled_mma_latent.thr_id.shape)
+            * self.iterations_qk_latent
+        )
         q_rope_copy_size = (
             cute.size_in_bytes(self.q_dtype, q_rope_smem_layout)
             * cute.size(qk_tiled_mma.thr_id.shape)
@@ -683,7 +740,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             * self.iterations_pv_k
         )
 
-        self.tma_copy_q_bytes = q_latent_copy_size + q_rope_copy_size
+        self.tma_copy_q_bytes = (
+            q_latent_copy_size
+            + q_latent_fp4_copy_size
+            + q_latent_sf_copy_size
+            + q_rope_copy_size
+        )
         self.tma_copy_kc_bytes = (
             kc_latent_copy_size + kc_latent_sf_copy_size + kc_rope_copy_size
         )
@@ -746,6 +808,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ],
                 1024,
             ]
+            # NVFP4 Q-latent FP4 SMEM (packed e2m1, produced host-side in Phase-1).
+            smem_q_latent_fp4: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.ab_fp4_dtype,
+                    cute.cosize(q_latent_fp4_smem_layout_staged),
+                ],
+                1024,
+            ]
             smem_q_rope: cute.struct.Align[
                 cute.struct.MemRange[
                     self.q_dtype, cute.cosize(q_rope_smem_layout_staged)
@@ -776,6 +846,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             pv_tiled_mma,
             tma_atom_q_latent,
             tma_tensor_q_latent,
+            tma_atom_q_latent_fp4,
+            tma_tensor_q_latent_fp4,
+            tma_atom_q_latent_sf,
+            tma_tensor_q_latent_sf,
             tma_atom_q_rope,
             tma_tensor_q_rope,
             tma_atom_c_latent,
@@ -795,6 +869,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             softmax_scale_log2,
             output_scale,
             q_latent_smem_layout_staged,
+            q_latent_fp4_smem_layout_staged,
             q_rope_smem_layout_staged,
             kc_latent_smem_layout_staged,
             kc_rope_smem_layout_staged,
@@ -883,6 +958,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tiled_mma_pv: cute.TiledMma,
         tma_atom_q_latent: Optional[cute.CopyAtom],
         mQL: cute.Tensor,
+        tma_atom_q_latent_fp4: Optional[cute.CopyAtom],
+        mQL_fp4: cute.Tensor,
+        tma_atom_q_latent_sf: Optional[cute.CopyAtom],
+        mQL_sf: cute.Tensor,
         tma_atom_q_rope: Optional[cute.CopyAtom],
         mQR: cute.Tensor,
         tma_atom_c_latent: Optional[cute.CopyAtom],
@@ -902,6 +981,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         q_latent_smem_layout_staged: cute.ComposedLayout,
+        q_latent_fp4_smem_layout_staged: cute.ComposedLayout,
         q_rope_smem_layout_staged: cute.ComposedLayout,
         kc_latent_smem_layout_staged: cute.ComposedLayout,
         kc_rope_smem_layout_staged: cute.ComposedLayout,
@@ -1002,6 +1082,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Prefetch tma descriptor
         if warp_idx == self.mma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_q_latent)
+            cpasync.prefetch_descriptor(tma_atom_q_latent_fp4)
+            cpasync.prefetch_descriptor(tma_atom_q_latent_sf)
             cpasync.prefetch_descriptor(tma_atom_q_rope)
             cpasync.prefetch_descriptor(tma_atom_c_latent)
             cpasync.prefetch_descriptor(tma_atom_c_rope)
@@ -1058,6 +1140,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # (MMA, MMA_H, MMA_R, PIPE)
         sQ = storage.smem_q_latent.get_tensor(
             q_latent_smem_layout_staged.outer, swizzle=q_latent_smem_layout_staged.inner
+        )
+        # NVFP4 Q-latent FP4 SMEM (consumed by the NVFP4 QK-latent MMA).
+        sQ_fp4 = storage.smem_q_latent_fp4.get_tensor(
+            q_latent_fp4_smem_layout_staged.outer,
+            swizzle=q_latent_fp4_smem_layout_staged.inner,
         )
         sQ_rope = storage.smem_q_rope.get_tensor(
             q_rope_smem_layout_staged.outer, swizzle=q_rope_smem_layout_staged.inner
@@ -1150,14 +1237,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tma_qk_params = SimpleNamespace(
                         tiled_mma_qk=tiled_mma_qk,
                         tma_atom_q_latent=tma_atom_q_latent,
+                        tma_atom_q_latent_fp4=tma_atom_q_latent_fp4,
+                        tma_atom_q_latent_sf=tma_atom_q_latent_sf,
                         tma_atom_q_rope=tma_atom_q_rope,
                         tma_atom_c_latent=tma_atom_c_latent,
                         tma_atom_c_rope=tma_atom_c_rope,
                         mQL=mQL,
+                        mQL_fp4=mQL_fp4,
+                        mQL_sf=mQL_sf,
                         mQR=mQR,
                         mCL=mCL,
                         mKR=mKR,
                         sQ=sQ,
+                        sQ_fp4=sQ_fp4,
+                        sQ_sf=sQ_sf,
                         sQ_rope=sQ_rope,
                         sKC=sKC_for_tma,
                         sKC_rope=sKC_rope_for_tma,
@@ -1646,6 +1739,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # (bM, bK, rM, rK, rL)
         mma_qk_tiler_mk = cute.select(self.mma_qk_tiler, mode=[0, 2])
         gQL = cute.flat_divide(qk_params.mQL, mma_qk_tiler_mk)
+        gQL_fp4 = cute.flat_divide(qk_params.mQL_fp4, mma_qk_tiler_mk)
+        gQL_sf = cute.flat_divide(qk_params.mQL_sf, mma_qk_tiler_mk)
         mma_qk_tiler_mk_rope = cute.select(self.mma_qk_rope_tiler, mode=[0, 2])
         gQR = cute.flat_divide(qk_params.mQR, mma_qk_tiler_mk_rope)
 
@@ -1653,6 +1748,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             common_params.blk_coord[0] % cute.size(qk_params.tiled_mma_qk.thr_id)
         )
         tSgQL = thr_mma_qk.partition_A(gQL)
+        tSgQL_fp4 = thr_mma_qk.partition_A(gQL_fp4)
+        tSgQL_sf = thr_mma_qk.partition_A(gQL_sf)
         tSgQR = thr_mma_qk.partition_A(gQR)
 
         cta_m = min(
@@ -1696,6 +1793,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.group_modes(qk_params.sQ, 0, 3),
             cute.group_modes(tSgQL, 0, 3),
         )
+        # FP4 Q-latent + Q-SF: same per-cta partition as the FP8 path; only the
+        # SMEM dtype + scale-factor strides differ.
+        tQsQ_fp4, tQLgQL_fp4_mkl = cpasync.tma_partition(
+            qk_params.tma_atom_q_latent_fp4,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(qk_params.sQ_fp4, 0, 3),
+            cute.group_modes(tSgQL_fp4, 0, 3),
+        )
+        tQsQ_sf, tQLgQL_sf_mkl = cpasync.tma_partition(
+            qk_params.tma_atom_q_latent_sf,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(qk_params.sQ_sf, 0, 3),
+            cute.group_modes(tSgQL_sf, 0, 3),
+        )
 
         tQsQ_rope, tQRgQR_mkl = cpasync.tma_partition(
             qk_params.tma_atom_q_rope,
@@ -1723,6 +1836,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tQLgQL = tQLgQL_mkl[
             None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
         ]
+        tQLgQL_fp4 = tQLgQL_fp4_mkl[
+            None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
+        ]
+        tQLgQL_sf = tQLgQL_sf_mkl[
+            None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
+        ]
         tQRgQR = tQRgQR_mkl[
             None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
         ]
@@ -1730,10 +1849,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # set extra params
         common_params.mPT = mPT
         qk_params.tQLgQL = tQLgQL
+        qk_params.tQLgQL_fp4 = tQLgQL_fp4
+        qk_params.tQLgQL_sf = tQLgQL_sf
         qk_params.tQRgQR = tQRgQR
         qk_params.tCLgCL = tCLgCL
         qk_params.tKRgKR = tKRgKR
         qk_params.tQsQ = tQsQ
+        qk_params.tQsQ_fp4 = tQsQ_fp4
+        qk_params.tQsQ_sf = tQsQ_sf
         qk_params.tQsQ_rope = tQsQ_rope
         qk_params.tKCsKC = tKCsKC
         qk_params.tKCsKC_rope = tKCsKC_rope
@@ -1874,11 +1997,26 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # expect the extra bytes for q.
             load_q_pipeline.producer_acquire(load_q_producer_state)
             for i in cutlass.range_constexpr(self.iterations_qk_latent):
-                # load q latent
+                # load q latent (FP8 — Phase-1 keeps this; SMEM unused by the
+                # NVFP4 QK-latent MMA but the bytes are still in tma_copy_q_bytes).
                 cute.copy(
                     qk_params.tma_atom_q_latent,
                     qk_params.tQLgQL[None, 0, i],
                     qk_params.tQsQ[None, (i, 0)],
+                    tma_bar_ptr=tma_bar_ptr,
+                )
+                # load q latent FP4 (host-side quant; B-side of NVFP4 QK-latent)
+                cute.copy(
+                    qk_params.tma_atom_q_latent_fp4,
+                    qk_params.tQLgQL_fp4[None, 0, i],
+                    qk_params.tQsQ_fp4[None, (i, 0)],
+                    tma_bar_ptr=tma_bar_ptr,
+                )
+                # load q latent SF (e4m3, viewed as int16 by TMA)
+                cute.copy(
+                    qk_params.tma_atom_q_latent_sf,
+                    qk_params.tQLgQL_sf[None, 0, i],
+                    qk_params.tQsQ_sf[None, (i, 0)],
                     tma_bar_ptr=tma_bar_ptr,
                 )
             for i in cutlass.range_constexpr(self.iterations_qk_rope):
