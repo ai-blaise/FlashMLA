@@ -81,6 +81,12 @@ struct SparseAttnDecodeParams {
     cutlass::bfloat16_t* __restrict__ extra_kv;  // [extra_num_blocks, extra_page_block_size, d_qk]
     int* __restrict__ extra_indices;   // [b, s_q, extra_topk]
     int* __restrict__ extra_topk_length;  // [b], may be nullptr
+
+    // NVFP4 KV variant: separate scales buffer. nullptr for FP8 path.
+    // Layout: [num_blocks, page_block_size, h_kv, NUM_NVFP4_SCALES_PADDED=32] uint8 (E4M3)
+    uint8_t* __restrict__ kv_scales;
+    int stride_kv_scales_block;  // bytes per block stride
+    int stride_kv_scales_row;    // bytes per token stride (NVFP4: 32)
     
     int stride_q_b, stride_q_s_q, stride_q_h_q;
     int stride_kv_block, stride_kv_row;

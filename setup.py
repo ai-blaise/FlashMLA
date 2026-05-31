@@ -49,7 +49,8 @@ def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+# ai-blaise build: use the symlinked csrc/cutlass -> flashinfer cutlass in-pod
+# subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -65,6 +66,7 @@ ext_modules.append(
         sources=[
             # API
             "csrc/api/api.cpp",
+            "csrc/api/sparse_decode_nvfp4.cu",
 
             # Misc kernels for decoding
             "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
@@ -102,6 +104,7 @@ ext_modules.append(
             "csrc/sm100/decode/head64/instantiations/v32.cu",
             "csrc/sm100/decode/head64/instantiations/model1.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128_nvfp4/instantiations/phase1_decode_k512.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),

@@ -401,6 +401,9 @@ sparse_attn_decode_interface(
         ku::get_optional_tensor_ptr<int>(extra_indices),
         ku::get_optional_tensor_ptr<int>(extra_topk_length),
 
+        // FP8 path: no separate scales buffer
+        nullptr, 0, 0,
+
         int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)), int64_stride_to_int(q.stride(2)),
         int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
         int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
@@ -493,3 +496,42 @@ sparse_attn_decode_interface(
 
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
 }
+
+
+// ============================================================
+// NVFP4 KV variant interface (Apache-2.0, ai-blaise extension)
+// ============================================================
+//
+// Decode path for native NVFP4 sparse-MLA: K is stored as packed e2m1
+// nibbles + per-block E4M3 scales, dequanted to BF16 in SMEM before the
+// existing BF16 UMMA pipeline.
+//
+// Bandwidth win over the FP8 baseline: ~36% less HBM K-read traffic per
+// indexed slot (224 + 32 + 128 = 384 B for NVFP4 vs 512 + 8 + 128 = 648 B
+// for FP8 with E8M0 scales).
+
+#include "sm100/prefill/sparse/fwd_for_small_topk/head128_nvfp4/phase1.h"
+
+// NVFP4 KV layout: 2 buffers
+//   - kv (nope+rope packed):  [num_pages, page_size, h_kv=1, 352] uint8
+//       Per token: 224 bytes FP4-packed nope + 128 bytes BF16 rope
+//   - kv_scales (E4M3):       [num_pages, page_size, h_kv=1, 32]  uint8
+//
+// Bandwidth win over FP8 MODEL1 (584 B/token): 384/584 = 34% reduction.
+//
+// Returns: (out [b, s_q, h_q, d_v]  bf16,
+//           lse [b, h_q, s_q]       f32,
+//           tile_scheduler_metadata, num_splits)
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_nvfp4_interface(
+    const at::Tensor &q,         // [b, s_q, h_q, d_qk=512] bf16
+    const at::Tensor &kv,        // [num_pages, page_size, h_kv=1, 352] uint8
+    const at::Tensor &kv_scales, // [num_pages, page_size, h_kv=1, 32]  uint8
+    const at::Tensor &indices,   // [b, s_q, topk] int32
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &attn_sink,
+    std::optional<at::Tensor> &tile_scheduler_metadata,
+    std::optional<at::Tensor> &num_splits,
+    int d_v,
+    float sm_scale
+);
