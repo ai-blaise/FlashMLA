@@ -65,7 +65,7 @@ sparse_attn_decode_nvfp4_interface(
 
     // For d_qk=576 (V3.2 head64x2 V32): single packed kv = 256 nope + 32 scales + 128 rope = 416 B
     // For d_qk=512 (MODEL1 head128): kv = 224 nope + 128 rope = 352 B; kv_scales = 32 B (separate)
-    const int NVFP4_NOPE_ROPE_BYTES = (d_qk == 576) ? 416 : 352;
+    const int NVFP4_NOPE_ROPE_BYTES = (d_qk == 576) ? 336 : 352;  // Phase 2 padded to 16B alignment  // Phase 2 V32 = 324 B
     const int NVFP4_SCALES_BYTES = 32;  // 32 e4m3 (block_size=16)
 
     bool have_topk_length = topk_length.has_value();

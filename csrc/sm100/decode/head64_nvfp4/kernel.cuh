@@ -46,10 +46,13 @@ KernelTemplate<MODEL_TYPE>
             plan.bar_q_tma.init(1);
             plan.bar_q_utccp.init(1);
             for (int i = 0; i < NUM_BUFS; ++i) {
-                plan.bar_rope_ready[i].init(1);
+                plan.bar_rope_ready[i].init(128);  // Phase 2: now signaled by dequant warpgroup (128 threads)
                 plan.bar_nope_ready[i].init(128);
                 plan.bar_raw_ready[i].init(1);
                 plan.bar_raw_free[i].init(128);
+                // Phase 2: raw FP4 rope barriers
+                plan.bar_raw_rope_ready[i].init(1);
+                plan.bar_raw_rope_free[i].init(128);
                 plan.bar_qk_done[i].init(1);
                 plan.bar_so_ready[i].init(128);
                 plan.bar_sv_done[i].init(1);
@@ -632,20 +635,19 @@ KernelTemplate<MODEL_TYPE>
                     for (int row = 0; row < B_TOPK; row += 4) {
                         if (row+4 < B_TOPK)
                             nxt_cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + row + 4);
-                        CUTE_UNROLL
-                        for (int t = 0; t < D_ROPE/(K_ROPE_SW/2); ++t) {
-                            ku::tma_gather4(
-                                block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_rope : &tma_params.tensor_map_kv_rope,
-                                plan.bar_rope_ready[rs.buf_idx],
-                                plan.u.kv.dequant[rs.buf_idx].rope.data() + (K_ROPE_SW/2)*row + t*B_TOPK*(K_ROPE_SW/2),
-                                t*(K_ROPE_SW/2),
-                                cur_indices,
-                                (int64_t)TMA::CacheHintSm90::EVICT_LAST
-                            );
-                        }
+                        // Phase 2: TMA loads packed FP4 rope (D_ROPE/2 bytes/token) into raw_rope.
+                        // Dequant warp will convert to BF16 in dequant.rope later.
+                        ku::tma_gather4(
+                            block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_rope : &tma_params.tensor_map_kv_rope,
+                            plan.bar_raw_rope_ready[rs.buf_idx],
+                            plan.u.kv.raw_rope[rs.buf_idx].data() + (D_ROPE/2)*row,
+                            0,
+                            cur_indices,
+                            (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                        );
                         cur_indices = nxt_cur_indices;
                     }
-                    plan.bar_rope_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_ROPE*sizeof(bf16));
+                    plan.bar_raw_rope_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*(D_ROPE/2)*sizeof(uint8_t));
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                     rs.update();
                 }
@@ -692,6 +694,8 @@ KernelTemplate<MODEL_TYPE>
 
                     int tma_coords[2];
                     alignas(16) e4m3 scales[2*NUM_SCALES_EACH_TOKEN];
+                    // Phase 2: 4 E4M3 rope scales/token, packed as uint32 per token.
+                    uint32_t rope_scales_pair[2];
                     char valid_mask = 0;
                     CUTE_UNROLL
                     for (int i = 0; i < 2; ++i) {
@@ -712,6 +716,10 @@ KernelTemplate<MODEL_TYPE>
                         uint4 hi = is_token_valid ? __ldg((uint4*)(cur_k_scales_ptr + offset + 16)) : uint4{0,0,0,0};
                         ((uint4*)(scales + i*NUM_SCALES_EACH_TOKEN))[0] = lo;
                         ((uint4*)(scales + i*NUM_SCALES_EACH_TOKEN))[1] = hi;
+                        // Phase 2: also load 4 E4M3 rope scales (1 uint32) for this token.
+                        // rope scales live after nope scales (offset NUM_SCALES_EACH_TOKEN) and after FP4 rope (offset D_ROPE/2).
+                        uint32_t rope_scales_x4 = is_token_valid ? __ldg((uint32_t*)(cur_k_scales_ptr + offset + NUM_SCALES_EACH_TOKEN + (D_ROPE/2))) : 0;
+                        rope_scales_pair[i] = rope_scales_x4;
                     }
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
@@ -720,6 +728,9 @@ KernelTemplate<MODEL_TYPE>
                     ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[1] = ((uint4*)scales)[1];
                     ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[2] = ((uint4*)scales)[2];
                     ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[3] = ((uint4*)scales)[3];
+                    // Phase 2: rope_scales SMEM store - 8 B/lane for 2 tokens * NUM_ROPE_SCALES(=4) bytes.
+                    // plan.rope_scales[buf]+lane_idx*2 advances by lane_idx*2*NUM_ROPE_SCALES = lane_idx*8 bytes.
+                    *(uint64_t*)(plan.rope_scales[rs.index_buf_idx] + lane_idx*2) = *(uint64_t*)rope_scales_pair;
                     *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
                     if (lane_idx%4 == 0)
                         plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;
@@ -779,10 +790,6 @@ KernelTemplate<MODEL_TYPE>
                     CUTE_UNROLL
                     for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
-                        // PTX 9.2: cvt.rn.bf16x2.e4m3x2 converts 2 e4m3 -> 2 bf16 in 1 inst.
-                        // 32 scales = 16 byte-pairs = 16 PTX insts (vs 32 + 32 float casts).
-                        // iter 11: LAZY scale conversion - reduces register pressure.
-                        // Scales loaded + converted inside inner col loop instead of upfront.
                         const e4m3* scales_src = plan.scales[rs.index_buf_idx][row_idx];
                         uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
                         CUTE_UNROLL
@@ -808,7 +815,7 @@ KernelTemplate<MODEL_TYPE>
                                 : "r"(cur_data_fp4));
                             int global_k_pos = local_col_idx * (GROUP_SIZE * 8) + idx_in_group * 8;
                             int scale_idx = global_k_pos / 16;
-                            // Lazy: load+convert this iter's scale on demand
+                            // iter 11: lazy scale load + cvt
                             uint16_t scale_e4m3_pair = *(uint16_t*)(scales_src + (scale_idx & ~1));
                             uint32_t scale_bf16_pair;
                             asm volatile("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(scale_bf16_pair) : "h"(scale_e4m3_pair));
@@ -880,6 +887,83 @@ KernelTemplate<MODEL_TYPE>
                 cutlass::arch::fence_view_async_shared();
                 plan.bar_nope_ready[rs.buf_idx].arrive();
                 plan.bar_raw_free[rs.buf_idx].arrive();
+
+                // Phase 2: rope dequant. Wait for FP4 rope TMA, dequant to BF16,
+                // write through CUTE tensor with SW64 swizzle so the UMMA consumer
+                // (SmemLayoutKTiles_DualGemm_SW64<1>) sees the right physical layout.
+                plan.bar_raw_rope_ready[rs.buf_idx].wait(rs.bar_phase);
+                {
+                    // SW64-swizzled view of dequant.rope: shape (B_H*2=128, 32) = 4096 bf16.
+                    Tensor sK_rope_dst = make_tensor(
+                        make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].rope.data()),
+                        SmemLayoutKTiles_DualGemm_SW64<1>{}
+                    );
+                    int tid = threadIdx.x % 128;
+                    if (tid < B_TOPK) {
+                        int token_idx = tid;
+                        uint8_t* rope_src = plan.u.kv.raw_rope[rs.buf_idx].data() + token_idx * (D_ROPE/2);
+                        e4m3* rope_scale_src = plan.rope_scales[rs.index_buf_idx][token_idx];
+                        alignas(8) __nv_bfloat16 rope_scales_bf16[NUM_ROPE_SCALES];
+                        {
+                            // iter 6: vectorized e4m3x2 -> bf16x2 cvt. NUM_ROPE_SCALES=4 -> 2 cvts.
+                            uint32_t rs_e4m3_quad = *(uint32_t*)rope_scale_src;
+                            uint16_t p_lo = (uint16_t)(rs_e4m3_quad & 0xFFFFu);
+                            uint16_t p_hi = (uint16_t)((rs_e4m3_quad >> 16) & 0xFFFFu);
+                            uint32_t b0, b1;
+                            asm volatile(
+                                "cvt.rn.bf16x2.e4m3x2 %0, %2;\n\t"
+                                "cvt.rn.bf16x2.e4m3x2 %1, %3;"
+                                : "=r"(b0), "=r"(b1)
+                                : "h"(p_lo), "h"(p_hi));
+                            *(uint32_t*)(rope_scales_bf16 + 0) = b0;
+                            *(uint32_t*)(rope_scales_bf16 + 2) = b1;
+                        }
+                        // 8 iters per thread, each: 4 bytes FP4 -> 8 BF16 elements
+                        CUTE_UNROLL
+                        for (int iter = 0; iter < D_ROPE/8; ++iter) {
+                            uint32_t cur_data_fp4 = *(uint32_t*)(rope_src + iter*4);
+                            uint32_t bf16x2_packed[4];
+                            asm volatile(
+                                "{\n"
+                                " .reg .b8 byte0, byte1, byte2, byte3;\n"
+                                " mov.b32 {byte0, byte1, byte2, byte3}, %4;\n"
+                                " cvt.rn.bf16x2.e2m1x2 %0, byte0;\n"
+                                " cvt.rn.bf16x2.e2m1x2 %1, byte1;\n"
+                                " cvt.rn.bf16x2.e2m1x2 %2, byte2;\n"
+                                " cvt.rn.bf16x2.e2m1x2 %3, byte3;\n"
+                                "}"
+                                : "=r"(bf16x2_packed[0]), "=r"(bf16x2_packed[1]),
+                                  "=r"(bf16x2_packed[2]), "=r"(bf16x2_packed[3])
+                                : "r"(cur_data_fp4));
+                            int scale_idx = (iter * 8) / 16;
+                            __nv_bfloat16 scale = rope_scales_bf16[scale_idx];
+                            __nv_bfloat162 scale_x2 = {scale, scale};
+                            alignas(16) __nv_bfloat16 data_bf16[8];
+                            CUTE_UNROLL
+                            for (int b = 0; b < 4; ++b) {
+                                __nv_bfloat162 bf16x2 = *reinterpret_cast<__nv_bfloat162*>(&bf16x2_packed[b]);
+                                __nv_bfloat162 result = __hmul2(bf16x2, scale_x2);
+                                data_bf16[b*2 + 0] = result.x;
+                                data_bf16[b*2 + 1] = result.y;
+                            }
+                            // Element-wise write through the SW64-swizzled CUTE tensor.
+                            // Map (token_idx, element_idx) -> (row, col) of (128, 32) layout:
+                            //   element_idx <  32: row = token_idx,        col = element_idx
+                            //   element_idx >= 32: row = token_idx + B_H,  col = element_idx - 32
+                            CUTE_UNROLL
+                            for (int e = 0; e < 8; ++e) {
+                                int element_idx = iter * 8 + e;
+                                int row = (element_idx < 32) ? token_idx : (token_idx + B_H);
+                                int col = element_idx & 0x1F;
+                                sK_rope_dst(row, col) = *reinterpret_cast<bf16*>(&data_bf16[e]);
+                            }
+                        }
+                    }
+                }
+                cutlass::arch::fence_view_async_shared();
+                plan.bar_rope_ready[rs.buf_idx].arrive();
+                plan.bar_raw_rope_free[rs.buf_idx].arrive();
+
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                 rs.update();
             }
@@ -907,7 +991,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.d_qk == D_Q);
     KU_ASSERT(params.d_v == D_V);
     if constexpr (MODEL_TYPE == ModelType::MODEL1) {
-        constexpr int BYTES_PER_TOKEN = (D_NOPE/2) + 2*D_ROPE + NUM_SCALES_EACH_TOKEN;
+        constexpr int BYTES_PER_TOKEN = (D_NOPE/2) + (D_ROPE/2) + NUM_SCALES_EACH_TOKEN + NUM_ROPE_SCALES;  // Phase 2 = 324 (V32)
         KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
     }
 
@@ -963,13 +1047,14 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
         );  // NOTE We combine 8 float8 into 1 int64 since boxdim cannot > 256
+        // Phase 2: rope is now FP4-packed UINT8, D_ROPE/2 bytes per token.
         CUtensorMap tensor_map_kv_rope = ku::make_tensor_map(
-            {D_ROPE, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
+            {D_ROPE/2, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
             {TMA_K_STRIDE},
-            {K_ROPE_SW/2, 1},
-            (uint8_t*)k_ptr + (MODEL_TYPE == ModelType::V32 ? ((D_NOPE/2)+NUM_SCALES_EACH_TOKEN) : (D_NOPE/2)),
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            K_ROPE_SW == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            {D_ROPE/2, 1},
+            (uint8_t*)k_ptr + (D_NOPE/2) + NUM_SCALES_EACH_TOKEN,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
         );
         return {tensor_map_kv_nope, tensor_map_kv_rope};
