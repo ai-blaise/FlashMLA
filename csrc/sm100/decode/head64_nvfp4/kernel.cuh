@@ -891,35 +891,27 @@ KernelTemplate<MODEL_TYPE>
                 plan.bar_nope_ready[rs.buf_idx].arrive();
                 plan.bar_raw_free[rs.buf_idx].arrive();
 
-                // Phase 2: rope dequant. Wait for FP4 rope TMA, then dequant 64 elements/token to BF16.
+                // Phase 2: rope dequant. Wait for FP4 rope TMA, dequant to BF16,
+                // write through CUTE tensor with SW64 swizzle so the UMMA consumer
+                // (SmemLayoutKTiles_DualGemm_SW64<1>) sees the right physical layout.
                 plan.bar_raw_rope_ready[rs.buf_idx].wait(rs.bar_phase);
                 {
-                    // Each thread handles a chunk of (B_H * D_ROPE) BF16 outputs.
-                    // 128 threads total in the dequant warpgroup. D_ROPE=64; B_H=64; total=4096 elements.
-                    // 4096/128 = 32 elements per thread = 4 cache lines of bf16x2 = 16 bytes per thread.
-                    // FP4 input: 4096/2 = 2048 bytes total / 128 threads = 16 bytes per thread = 8 e2m1x2 = 16 nibbles = 16 elements.
-                    // Hmm 16 elements per thread covers half of D_ROPE if B_H/2=32 thread groups.
-                    //
-                    // Layout: each token has D_ROPE=64 elements. raw_rope is [B_H][D_ROPE/2] uint8 packed.
-                    // Tokens distributed across the 128 threads, e.g. 64 tokens / 64 row-threads = 1 token/thread for rows.
-                    //
-                    // Simpler approach (cache-friendly): each thread processes 1 token's D_ROPE=64 elements.
-                    // 64 elements / 8 elements per FP4 iter (4 bytes) = 8 iters per thread.
-                    // Output: 64 BF16 = 128 bytes / thread.
-                    // 128 threads x 1 token each = 128 tokens but B_H=B_TOPK=64. Use 64 of 128 threads.
+                    // SW64-swizzled view of dequant.rope: shape (B_H*2=128, 32) = 4096 bf16.
+                    Tensor sK_rope_dst = make_tensor(
+                        make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].rope.data()),
+                        SmemLayoutKTiles_DualGemm_SW64<1>{}
+                    );
                     int tid = threadIdx.x % 128;
                     if (tid < B_TOPK) {
                         int token_idx = tid;
                         uint8_t* rope_src = plan.u.kv.raw_rope[rs.buf_idx].data() + token_idx * (D_ROPE/2);
-                        bf16* rope_dst = plan.u.kv.dequant[rs.buf_idx].rope.data() + token_idx * D_ROPE;
                         e4m3* rope_scale_src = plan.rope_scales[rs.index_buf_idx][token_idx];
-                        // Convert 4 E4M3 scales to bf16
                         __nv_bfloat16 rope_scales_bf16[NUM_ROPE_SCALES];
                         CUTE_UNROLL
                         for (int s = 0; s < NUM_ROPE_SCALES; ++s) {
                             rope_scales_bf16[s] = __float2bfloat16_rn(float(rope_scale_src[s]));
                         }
-                        // 8 iters per thread, each consuming 4 bytes FP4 -> 8 BF16
+                        // 8 iters per thread, each: 4 bytes FP4 -> 8 BF16 elements
                         CUTE_UNROLL
                         for (int iter = 0; iter < D_ROPE/8; ++iter) {
                             uint32_t cur_data_fp4 = *(uint32_t*)(rope_src + iter*4);
@@ -936,11 +928,10 @@ KernelTemplate<MODEL_TYPE>
                                 : "=r"(f16x2_packed[0]), "=r"(f16x2_packed[1]),
                                   "=r"(f16x2_packed[2]), "=r"(f16x2_packed[3])
                                 : "r"(cur_data_fp4));
-                            // Scale lookup: each iter covers 8 elements. scale_idx = (iter*8) / 16
                             int scale_idx = (iter * 8) / 16;
                             __nv_bfloat16 scale = rope_scales_bf16[scale_idx];
                             __nv_bfloat162 scale_x2 = {scale, scale};
-                            alignas(16) __nv_bfloat16 data_bf16[8];
+                            __nv_bfloat16 data_bf16[8];
                             CUTE_UNROLL
                             for (int b = 0; b < 4; ++b) {
                                 __half2 h2 = *reinterpret_cast<__half2*>(&f16x2_packed[b]);
@@ -952,7 +943,17 @@ KernelTemplate<MODEL_TYPE>
                                 data_bf16[b*2 + 0] = result.x;
                                 data_bf16[b*2 + 1] = result.y;
                             }
-                            *(__int128_t*)(rope_dst + iter*8) = *(__int128_t*)data_bf16;
+                            // Element-wise write through the SW64-swizzled CUTE tensor.
+                            // Map (token_idx, element_idx) -> (row, col) of (128, 32) layout:
+                            //   element_idx <  32: row = token_idx,        col = element_idx
+                            //   element_idx >= 32: row = token_idx + B_H,  col = element_idx - 32
+                            CUTE_UNROLL
+                            for (int e = 0; e < 8; ++e) {
+                                int element_idx = iter * 8 + e;
+                                int row = (element_idx < 32) ? token_idx : (token_idx + B_H);
+                                int col = element_idx & 0x1F;
+                                sK_rope_dst(row, col) = *reinterpret_cast<bf16*>(&data_bf16[e]);
+                            }
                         }
                     }
                 }
