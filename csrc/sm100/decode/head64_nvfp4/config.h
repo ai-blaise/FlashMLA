@@ -38,10 +38,17 @@ static constexpr int D_ROPE = 64;
 static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 16 : 16;  // NVFP4 block size
 static constexpr bool V_HAVE_ROPE = MODEL_TYPE == ModelType::V32 ? false : true;
 static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 32 : 32;    // NVFP4 block_size=16 -> 32 scales per token for D_NOPE=512 (V32) or 28 padded to 32 (MODEL1)
+// Phase 2: per-token E4M3 rope scales. D_ROPE/block_size_16 = 4 scales.
+static constexpr int NUM_ROPE_SCALES = D_ROPE / 16;
 // NVFP4 V32: D_NOPE/2 (=256) packed FP4 + 2*D_ROPE (=128 BF16) + NUM_SCALES (=32 E4M3)
 // = 416 B/token. Inline layout (scales follow rope per token), matching FP8 V32 architecture.
 // MODEL1: D_NOPE/2 (=224) + 2*D_ROPE (=128) + 32 scales = 384.
-static constexpr int TMA_K_STRIDE = MODEL_TYPE == ModelType::V32 ? (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
+// Phase 2 NVFP4: D_NOPE/2 (=256) + D_ROPE/2 (=32 packed FP4) + NUM_SCALES (=32) + NUM_ROPE_SCALES (=4)
+// = 324 B/token (V32). MODEL1 same. Could pad to 336 for 16-byte alignment if TMA needs.
+// Phase 2 payload = 256 nope + 32 rope + 32 nope_scales + 4 rope_scales = 324 B.
+// TMA requires 16-byte alignment of outer stride. Pad to 336 (21*16) with 12 B/token padding.
+static constexpr int PHASE2_PAYLOAD = (D_NOPE/2) + (D_ROPE/2) + NUM_SCALES_EACH_TOKEN + NUM_ROPE_SCALES;
+static constexpr int TMA_K_STRIDE = ((PHASE2_PAYLOAD + 15) / 16) * 16;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
 static_assert(D_NOPE + D_ROPE == D_Q);
 static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
 
@@ -177,6 +184,8 @@ struct SharedMemoryPlan {
             static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not covers raw_nope
             // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope
             array_aligned<uint8_t, B_H*D_NOPE/2> raw_nope[NUM_BUFS];  // Raw FP4-packed NoPE
+            // Phase 2: packed FP4 rope, B_H*D_ROPE/2 bytes per buf.
+            array_aligned<uint8_t, B_H*D_ROPE/2> raw_rope[NUM_BUFS];  // Raw FP4-packed RoPE
         } kv;
     } u;
     union {
@@ -187,10 +196,14 @@ struct SharedMemoryPlan {
     char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
     CUTE_ALIGNAS(16) int tma_coord[NUM_INDEX_BUFS][B_TOPK];
     CUTE_ALIGNAS(16) e4m3 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];  // NVFP4 E4M3 per-block scales
+    // Phase 2: per-block E4M3 scales for FP4 rope. 4 scales/token (D_ROPE=64 / block_size=16).
+    CUTE_ALIGNAS(16) e4m3 rope_scales[NUM_INDEX_BUFS][B_TOPK][NUM_ROPE_SCALES];
     array_aligned<uint32_t, 1> tmem_start_addr;
     transac_bar_t bar_last_store_done;
     transac_bar_t bar_q_tma, bar_q_utccp;
     transac_bar_t bar_rope_ready[NUM_BUFS];
+    // Phase 2: barriers for raw FP4 rope (TMA -> raw_rope) before dequant warp converts to BF16.
+    transac_bar_t bar_raw_rope_ready[NUM_BUFS], bar_raw_rope_free[NUM_BUFS];
     transac_bar_t bar_nope_ready[NUM_BUFS];
     transac_bar_t bar_raw_ready[NUM_BUFS], bar_raw_free[NUM_BUFS];
     transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS], bar_valid_coord_scale_free[NUM_INDEX_BUFS];
