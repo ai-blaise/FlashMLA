@@ -522,27 +522,79 @@ KernelTemplate<MODEL_TYPE>
                 tP.data().get() = tmem_cols::P;
                 tO.data().get() = tmem_cols::O;
 
-                // ----- COMMIT-1 SCAFFOLDING (no semantics) -----
-                // Exercise the FP4 MMA atom alias at compile time without changing runtime
-                // behavior. Commit 2 wires the real gemm() call against this atom.
+                // ----- COMMIT-2 SCAFFOLDING (FP4 MMA pieces, dead code) -----
+                // Builds the full FP4 MMA call chain (sQ_fp4 + sK_fp4 SMEM tensors,
+                // SF SMEM descriptors, UTCCP code, tiled_mma.with(SFA,SFB), cute::gemm)
+                // wrapped under `if constexpr (false)` so iter-11 numerics are unchanged.
+                //
+                // KEY ARCHITECTURAL FINDING confirmed while wiring this scaffolding:
+                //   SM100_MMA_MXF4_SS is an SS-only atom (no TS variant exists in
+                //   /home/spencer/refs/cutlass/include/cute/arch/mma_sm100_umma.hpp).
+                //   Q therefore MUST live in SMEM (as e2m1 FP4) for the block-scaled
+                //   MMA. The existing kernel routes Q through TMEM at tmem_cols::Q
+                //   via SM100_UTCCP_128dp256bit_1cta. Commit 3 will switch the QK
+                //   NoPE Q path to read sQ_fp4 directly from SMEM, leaving Q TMEM
+                //   only for the BF16 RoPE path. The in-kernel BF16 -> FP4 quant
+                //   that populates plan.u.qo.o.fp4.q_fp4 / q_scales is deferred to
+                //   commit 3; commit 4 moves it host-side.
                 if constexpr (false) {
-                    TiledMMA tiled_mma_S_nvfp4 = TiledMMA_S_NVFP4{};
-                    // Touch the FP4 Q/scales SMEM to force the layout instantiation through nvcc.
+                    TiledMMA tiled_mma_S = TiledMMA_S_NVFP4{};
+
+                    // ---- FP4 Q (SMEM) + FP4 K (raw_nope as e2m1) ----
                     Tensor sQ_fp4 = make_tensor(
                         make_smem_ptr(reinterpret_cast<e2m1*>(plan.u.qo.o.fp4.q_fp4.data())),
                         SmemLayoutQ_FP4{}
                     );
-                    Tensor sQ_scales = make_tensor(
-                        make_smem_ptr(&plan.u.qo.o.fp4.q_scales[0][0]),
-                        Shape<Int<B_H>, Int<NUM_SCALES_EACH_TOKEN>>{}
+                    Tensor sK_fp4 = make_tensor(
+                        make_smem_ptr(reinterpret_cast<e2m1*>(plan.u.kv.raw_nope[0].data())),
+                        SmemLayoutQ_FP4{}
                     );
-                    (void)tiled_mma_S_nvfp4;
-                    (void)sQ_fp4;
-                    (void)sQ_scales;
+
+                    // ---- SFA / SFB TMEM fragments ----
+                    // FrgTypeSFA/B are UMMA::tmem_sf_frg specializations. We construct
+                    // them with a partition_shape_*-derived shape and set the TMEM column.
+                    Tensor tCtSFA = make_tensor<typename decltype(tiled_mma_S)::FrgTypeSFA>(
+                        partition_shape_A(tiled_mma_S, Shape<Int<B_H*2>, Int<D_NOPE>>{})
+                    );
+                    tCtSFA.data().get() = tmem_cols::SFA_Q;
+                    Tensor tCtSFB = make_tensor<typename decltype(tiled_mma_S)::FrgTypeSFB>(
+                        partition_shape_B(tiled_mma_S, Shape<Int<B_TOPK*2>, Int<D_NOPE>>{})
+                    );
+                    tCtSFB.data().get() = tmem_cols::SFB_K;
+
+                    // ---- SF SMEM descriptors for UTCCP ----
+                    // Q scales: [B_H, NUM_SCALES_EACH_TOKEN] e4m3 (=ue4m3 bitwise),
+                    // K scales: [B_TOPK, NUM_SCALES_EACH_TOKEN] e4m3.
+                    UMMA::SmemDescriptor sQ_sf_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                        make_tensor(
+                            make_smem_ptr(reinterpret_cast<e4m3*>(&plan.u.qo.o.fp4.q_scales[0][0])),
+                            Layout<Shape<Int<B_H>, Int<NUM_SCALES_EACH_TOKEN>>, Stride<Int<NUM_SCALES_EACH_TOKEN>, _1>>{}
+                        )
+                    );
+                    UMMA::SmemDescriptor sK_sf_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                        make_tensor(
+                            make_smem_ptr(reinterpret_cast<e4m3*>(&plan.scales[0][0][0])),
+                            Layout<Shape<Int<B_TOPK>, Int<NUM_SCALES_EACH_TOKEN>>, Stride<Int<NUM_SCALES_EACH_TOKEN>, _1>>{}
+                        )
+                    );
+
+                    // ---- UTCCP SMEM -> TMEM ----
+                    SM100_UTCCP_4x32dp128bit_1cta::copy(sQ_sf_desc, tmem_cols::SFA_Q);
+                    SM100_UTCCP_4x32dp128bit_1cta::copy(sK_sf_desc, tmem_cols::SFB_K);
+
+                    // ---- The FP4 MMA call itself ----
+                    auto sQ_fp4_frag = tiled_mma_S.get_slice(_0{}).partition_fragment_A(sQ_fp4);
+                    auto sK_fp4_frag = tiled_mma_S.get_slice(_0{}).partition_fragment_B(sK_fp4);
+                    auto mma_cfg = tiled_mma_S.with(UMMA::ScaleOut::One, tCtSFA, tCtSFB);
+                    CUTE_UNROLL
+                    for (int k = 0; k < size<2>(sQ_fp4_frag); ++k) {
+                        cute::gemm(mma_cfg, sQ_fp4_frag(_, _, k), sK_fp4_frag(_, _, k), tP);
+                    }
+
                     (void)tmem_cols::SFA_Q;
                     (void)tmem_cols::SFB_K;
                 }
-                // ----- END COMMIT-1 SCAFFOLDING -----
+                // ----- END COMMIT-2 SCAFFOLDING -----
 
                 // Wait for UTCCP
                 plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
