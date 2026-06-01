@@ -109,7 +109,7 @@ protected:
 
 
 // NVFP4 KV variant of Head64x2 — calls head64_nvfp4 kernel twice for h_q=128
-// Layout per token: 256 FP4 nope + 32 E4M3 scales + 128 BF16 rope = 416 B (V32)
+// V32 layout per token: 288 FP4 score bytes + 36 E4M3 scales + 12 B padding = 336 B.
 class Decode_Sm100_Head64x2_NVFP4_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_128,
@@ -537,31 +537,30 @@ sparse_attn_decode_interface(
 // NVFP4 KV variant interface (Apache-2.0, ai-blaise extension)
 // ============================================================
 //
-// Decode path for native NVFP4 sparse-MLA: K is stored as packed e2m1
-// nibbles + per-block E4M3 scales, dequanted to BF16 in SMEM before the
+// Decode path for NVFP4 sparse-MLA. The V3.2 path stores every QK score
+// dimension, including RoPE, as packed e2m1 with inline E4M3 block scales.
+// The current production bridge dequants to BF16 in SMEM before entering the
 // existing BF16 UMMA pipeline.
-//
-// Bandwidth win over the FP8 baseline: ~36% less HBM K-read traffic per
-// indexed slot (224 + 32 + 128 = 384 B for NVFP4 vs 512 + 8 + 128 = 648 B
-// for FP8 with E8M0 scales).
 
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128_nvfp4/phase1.h"
 
-// NVFP4 KV layout: 2 buffers
-//   - kv (nope+rope packed):  [num_pages, page_size, h_kv=1, 352] uint8
-//       Per token: 224 bytes FP4-packed nope + 128 bytes BF16 rope
-//   - kv_scales (E4M3):       [num_pages, page_size, h_kv=1, 32]  uint8
-//
-// Bandwidth win over FP8 MODEL1 (584 B/token): 384/584 = 34% reduction.
+// V3.2 full-NVFP4 layout:
+//   - kv: [num_pages, page_size, h_kv=1, 336] uint8
+//       Per token: 288 bytes FP4-packed score dims + 36 bytes E4M3 scales
+//       + 12 bytes padding.
+//   - kv_scales is unused for V3.2 and kept only for API compatibility.
+// MODEL1 keeps the legacy split layout:
+//   - kv:        [num_pages, page_size, h_kv=1, 352] uint8
+//   - kv_scales: [num_pages, page_size, h_kv=1, 32]  uint8
 //
 // Returns: (out [b, s_q, h_q, d_v]  bf16,
 //           lse [b, h_q, s_q]       f32,
 //           tile_scheduler_metadata, num_splits)
 std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_nvfp4_interface(
-    const at::Tensor &q,         // [b, s_q, h_q, d_qk=512] bf16
-    const at::Tensor &kv,        // [num_pages, page_size, h_kv=1, 352] uint8
-    const at::Tensor &kv_scales, // [num_pages, page_size, h_kv=1, 32]  uint8
+    const at::Tensor &q,         // [b, s_q, h_q, d_qk] bf16
+    const at::Tensor &kv,        // V3.2: [num_pages, page_size, h_kv=1, 336] uint8
+    const at::Tensor &kv_scales, // MODEL1 only: [num_pages, page_size, h_kv=1, 32] uint8
     const at::Tensor &indices,   // [b, s_q, topk] int32
     const std::optional<at::Tensor> &topk_length,
     const std::optional<at::Tensor> &attn_sink,

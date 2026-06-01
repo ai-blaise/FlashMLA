@@ -63,10 +63,10 @@ sparse_attn_decode_nvfp4_interface(
     int h_kv = kv.size(2);
     int topk = indices.size(2);
 
-    // For d_qk=576 (V3.2 head64x2 V32): single packed kv = 256 nope + 32 scales + 128 rope = 416 B
-    // For d_qk=512 (MODEL1 head128): kv = 224 nope + 128 rope = 352 B; kv_scales = 32 B (separate)
-    const int NVFP4_NOPE_ROPE_BYTES = (d_qk == 576) ? 416 : 352;
-    const int NVFP4_SCALES_BYTES = 32;  // 32 e4m3 (block_size=16)
+    // For d_qk=576 (V3.2): full-NVFP4 score KV = 288 FP4 bytes + 36 scales + 12 padding = 336 B.
+    // For d_qk=512 (MODEL1): legacy packed KV remains 352 B; kv_scales is separate.
+    const int NVFP4_NOPE_ROPE_BYTES = (d_qk == 576) ? 336 : 352;
+    const int NVFP4_SCALES_BYTES = 32;  // MODEL1 separate scale buffer size
 
     bool have_topk_length = topk_length.has_value();
     bool have_attn_sink = attn_sink.has_value();
@@ -106,7 +106,9 @@ sparse_attn_decode_nvfp4_interface(
     }
     // For d_qk=576, scales are inline in the kv buffer; kv_scales tensor is unused.
     TORCH_CHECK(kv.stride(1) == NVFP4_NOPE_ROPE_BYTES, "kv tokens must be contiguous; stride(1)=", kv.stride(1));
-    TORCH_CHECK(kv_scales.stride(1) == NVFP4_SCALES_BYTES, "kv_scales tokens must be contiguous; stride(1)=", kv_scales.stride(1));
+    if (d_qk == 512) {
+        TORCH_CHECK(kv_scales.stride(1) == NVFP4_SCALES_BYTES, "kv_scales tokens must be contiguous; stride(1)=", kv_scales.stride(1));
+    }
     KU_CHECK_SHAPE(indices, b, s_q, topk);
     KU_CHECK_SHAPE(topk_length, b);
     KU_CHECK_SHAPE(attn_sink, h_q);

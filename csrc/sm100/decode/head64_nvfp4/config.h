@@ -37,11 +37,13 @@ static constexpr int D_NOPE = MODEL_TYPE == ModelType::V32 ? 512 : 448;
 static constexpr int D_ROPE = 64;
 static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 16 : 16;  // NVFP4 block size
 static constexpr bool V_HAVE_ROPE = MODEL_TYPE == ModelType::V32 ? false : true;
-static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 32 : 32;    // NVFP4 block_size=16 -> 32 scales per token for D_NOPE=512 (V32) or 28 padded to 32 (MODEL1)
-// NVFP4 V32: D_NOPE/2 (=256) packed FP4 + 2*D_ROPE (=128 BF16) + NUM_SCALES (=32 E4M3)
-// = 416 B/token. Inline layout (scales follow rope per token), matching FP8 V32 architecture.
-// MODEL1: D_NOPE/2 (=224) + 2*D_ROPE (=128) + 32 scales = 384.
-static constexpr int TMA_K_STRIDE = MODEL_TYPE == ModelType::V32 ? (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
+static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 36 : 32;
+// V32 full-NVFP4 token layout: 576 packed FP4 score dims (288 B),
+// 36 E4M3 scales (one per 16 dims), then 12 B padding for 16 B alignment.
+// PV consumes only the first D_V=512 dequantized dims.
+static constexpr int NVFP4_SCORE_BYTES = MODEL_TYPE == ModelType::V32 ? D_Q / 2 : D_NOPE / 2;
+static constexpr int NVFP4_TOKEN_BYTES = MODEL_TYPE == ModelType::V32 ? 336 : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;
+static constexpr int TMA_K_STRIDE = NVFP4_TOKEN_BYTES;
 static_assert(D_NOPE + D_ROPE == D_Q);
 static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
 
@@ -176,7 +178,7 @@ struct SharedMemoryPlan {
             } dequant[NUM_BUFS];
             static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not covers raw_nope
             // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope
-            array_aligned<uint8_t, B_H*D_NOPE/2> raw_nope[NUM_BUFS];  // Raw FP4-packed NoPE
+            array_aligned<uint8_t, B_H*NVFP4_SCORE_BYTES> raw_nope[NUM_BUFS];  // Raw FP4-packed score dims
         } kv;
     } u;
     union {
