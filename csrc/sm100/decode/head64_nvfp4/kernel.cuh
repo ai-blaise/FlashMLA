@@ -532,9 +532,9 @@ KernelTemplate<MODEL_TYPE>
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                     if constexpr (MODEL_TYPE == ModelType::V32) {
-                        // V3.2: RoPE behaves like an extra block with size 64, so we can do RoPE first
+                        // V3.2 dequant writes NoPE and RoPE in one pass, so one readiness wait covers both.
                         // QK RoPE
-                        plan.bar_rope_ready[rs.buf_idx].wait(rs.bar_phase);
+                        plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
                         ku::tcgen05_after_thread_sync();
                         Tensor tQ_rope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_ROPE/2>>{})
@@ -544,8 +544,6 @@ KernelTemplate<MODEL_TYPE>
                         ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
 
                         // QK NoPE
-                        plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
-                        ku::tcgen05_after_thread_sync();
                         Tensor tQ_nope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_NOPE/2>>{})
                         );
@@ -881,9 +879,6 @@ KernelTemplate<MODEL_TYPE>
                 }
                 cutlass::arch::fence_view_async_shared();
                 plan.bar_nope_ready[rs.buf_idx].arrive();
-                if constexpr (MODEL_TYPE == ModelType::V32) {
-                    plan.bar_rope_ready[rs.buf_idx].arrive();
-                }
                 plan.bar_raw_free[rs.buf_idx].arrive();
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                 rs.update();

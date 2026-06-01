@@ -56,19 +56,21 @@ python3 tests/nvfp4/bench_nvfp4_vs_fp8.py \
   --batch-sizes 1,8,32,64 \
   --topk 1024 \
   --warmup 20 \
-  --iters 120
+  --iters 240
 ```
 
-| Batch | Full-NVFP4 min us | FP8 min us | Full-NVFP4 vs FP8 |
-| ---: | ---: | ---: | ---: |
-| 1 | 59.5232 | 59.5123 | 0.9998x |
-| 8 | 65.6304 | 65.5869 | 0.9993x |
-| 32 | 82.5702 | 82.1062 | 0.9944x |
-| 64 | 104.8762 | 104.7885 | 0.9992x |
+| Batch | Full-NVFP4 min us | FP8 min us | Full-NVFP4 vs FP8 | Full-NVFP4 bytes/token | FP8 bytes/token |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 59.4823 | 59.4723 | 0.9998x | 336 | 656 |
+| 8 | 64.0575 | 65.0521 | 1.0155x | 336 | 656 |
+| 32 | 82.6195 | 81.9123 | 0.9914x | 336 | 656 |
+| 64 | 104.7814 | 105.2602 | 1.0046x | 336 | 656 |
 
 IKP SASS metrics showed the original bridge was dominated by scalar byte scale gathering in `csrc/sm100/decode/head64_nvfp4/kernel.cuh`. The current bridge therefore vector-loads the 36 inline E4M3 scale bytes and writes them directly into the shared scale buffer. That removes the local temporary copy and brings the BF16 bridge close to FP8 while preserving the 336-byte full-NVFP4 cache layout.
 
-The bridge reduces cache bytes from 656 bytes/token in the FP8 V3.2 layout to 336 bytes/token. The remaining gap is now small but still exists at batch 8 and 32, so the next required optimization remains native NVFP4 tensor-core QK using the validated CuTe/CZS scaffold layout rather than more BF16 bridge polishing.
+The V3.2 bridge now uses a single readiness barrier for the combined NoPE/RoPE dequant pass. The dequant producer writes both regions together, so the consumer waits on `bar_nope_ready` once, runs RoPE QK first, then immediately runs NoPE QK without a second barrier wait. This preserves the existing BF16 FlashMLA QK/PV pipeline while removing redundant synchronization from the full-NVFP4 storage bridge.
+
+The bridge reduces cache bytes from 656 bytes/token in the FP8 V3.2 layout to 336 bytes/token. It now beats FP8 at batch 8 and 64, ties at batch 1, and remains slightly behind at batch 32. The next required optimization remains native NVFP4 tensor-core QK using the validated CuTe/CZS scaffold layout rather than more BF16 bridge polishing.
 
 ### Native QK Cache-Row Scaffold
 
@@ -128,5 +130,7 @@ ptxas for this V32 path.
 | 352-byte production KV row stride | Native-QK scaffold was slightly faster in one cold sweep but tied after warmup; production bridge regressed batch 8 and 32, so 336 bytes remains the production layout |
 | Native QK over the BF16 bridge shared-memory overlay | Compiled after canonical layout fixes but deadlocked or overwrote live scratch; not production-safe without a dedicated native-QK scratch plan |
 | Direct `cvt.rn.bf16x2.e4m3x2` scale conversion in the V32 bridge | Rejected by CUDA 13.1 ptxas with unexpected instruction type errors |
+| FP16 E4M3 scale decode with FP16 product before BF16 store | Correct, but slower than the BF16 bridge at batch 8, 32, and 64 |
+| FP16 E4M3 scale decode with BF16 multiply/store | Correct, but slower than the BF16 bridge at batch 8, 32, and 64 |
 
 These candidates should not be retried unless the surrounding dequant layout changes substantially.
