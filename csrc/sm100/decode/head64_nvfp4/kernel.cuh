@@ -785,6 +785,19 @@ KernelTemplate<MODEL_TYPE>
                     for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
                         const e4m3* scales_src = plan.scales[rs.index_buf_idx][row_idx];
+                        // Precompute only the COLS_PER_GROUP scales this thread actually reads (skip-4 pattern).
+                        __nv_bfloat162 scale_x2_arr[COLS_PER_GROUP];
+                        CUTE_UNROLL
+                        for (int c = 0; c < COLS_PER_GROUP; ++c) {
+                            int scale_idx = (c * (GROUP_SIZE * 8) + idx_in_group * 8) / 16;
+                            uint8_t scale_byte = *reinterpret_cast<const uint8_t*>(&scales_src[scale_idx]);
+                            uint16_t packed_in = (uint16_t)scale_byte | ((uint16_t)scale_byte << 8);
+                            uint32_t scale_bits;
+                            asm volatile(
+                                "cvt.rn.bf16x2.e4m3x2 %0, %1;"
+                                : "=r"(scale_bits) : "h"(packed_in));
+                            scale_x2_arr[c] = *reinterpret_cast<__nv_bfloat162*>(&scale_bits);
+                        }
                         uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
                         CUTE_UNROLL
                         for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
@@ -792,32 +805,25 @@ KernelTemplate<MODEL_TYPE>
                             uint32_t next_data_fp4 = (local_col_idx + 1 < COLS_PER_GROUP)
                                 ? get_raw_fp4(local_row_idx, local_col_idx + 1)
                                 : 0u;
-                            uint32_t f16x2_packed[4];
+                            uint32_t bf16x2_packed[4];
                             asm volatile(
                                 "{\n"
                                 " .reg .b8 byte0, byte1, byte2, byte3;\n"
                                 " mov.b32 {byte0, byte1, byte2, byte3}, %4;\n"
-                                " cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
-                                " cvt.rn.f16x2.e2m1x2 %1, byte1;\n"
-                                " cvt.rn.f16x2.e2m1x2 %2, byte2;\n"
-                                " cvt.rn.f16x2.e2m1x2 %3, byte3;\n"
+                                " cvt.rn.bf16x2.e2m1x2 %0, byte0;\n"
+                                " cvt.rn.bf16x2.e2m1x2 %1, byte1;\n"
+                                " cvt.rn.bf16x2.e2m1x2 %2, byte2;\n"
+                                " cvt.rn.bf16x2.e2m1x2 %3, byte3;\n"
                                 "}"
-                                : "=r"(f16x2_packed[0]),
-                                  "=r"(f16x2_packed[1]),
-                                  "=r"(f16x2_packed[2]),
-                                  "=r"(f16x2_packed[3])
+                                : "=r"(bf16x2_packed[0]),
+                                  "=r"(bf16x2_packed[1]),
+                                  "=r"(bf16x2_packed[2]),
+                                  "=r"(bf16x2_packed[3])
                                 : "r"(cur_data_fp4));
-                            int global_k_pos = local_col_idx * (GROUP_SIZE * 8) + idx_in_group * 8;
-                            int scale_idx = global_k_pos / 16;
-                            __nv_bfloat16 scale = __float2bfloat16_rn(float(scales_src[scale_idx]));
-                            __nv_bfloat162 scale_x2 = {scale, scale};
+                            __nv_bfloat162 scale_x2 = scale_x2_arr[local_col_idx];
                             CUTE_UNROLL
                             for (int b = 0; b < 4; ++b) {
-                                __half2 h2 = *reinterpret_cast<__half2*>(&f16x2_packed[b]);
-                                __nv_bfloat162 bf16x2 = {
-                                    __float2bfloat16_rn(__half2float(h2.x)),
-                                    __float2bfloat16_rn(__half2float(h2.y))
-                                };
+                                __nv_bfloat162 bf16x2 = *reinterpret_cast<__nv_bfloat162*>(&bf16x2_packed[b]);
                                 __nv_bfloat162 result = __hmul2(bf16x2, scale_x2);
                                 data_bf16[b * 2 + 0] = result.x;
                                 data_bf16[b * 2 + 1] = result.y;
