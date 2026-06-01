@@ -862,19 +862,27 @@ KernelTemplate<MODEL_TYPE>
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                    // Phase 4 cont'd ATTEMPTED: write through canonical SmemLayoutAtomSFB_QK tensor.
-                    // FAILED: layout has rank-3 outer mode ((32,4),1) requiring nested coord tuples,
-                    // not flat (N, K_block). Reverting to flat uint4 writes for now. The byte-level
-                    // mapping mismatch between flat writes here and canonical reads at MMA consumer
-                    // is the LAST remaining structural correctness issue. Resolution requires either:
-                    //   (a) inspect cute layout via cute::print(SmemLayoutAtomSFB_QK{}) and map
-                    //       (token, scale) -> nested coord tuple matching the 5-mode structure
-                    //   (b) hand-compute the byte offset formula and use raw uint8 stores at the
-                    //       canonical-layout-matching positions
-                    ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[0] = ((uint4*)scales)[0];
-                    ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[1] = ((uint4*)scales)[1];
-                    ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[2] = ((uint4*)scales)[2];
-                    ((uint4*)(plan.scales[rs.index_buf_idx] + lane_idx*2))[3] = ((uint4*)scales)[3];
+                    // Phase 4 cont'd v2: use cute::Layout flat indexing.
+                    // The canonical SmemLayoutAtomSFB_QK is too nested for direct (N, K) indexing,
+                    // but flat int → byte offset works via layout(flat_idx).
+                    // For canonical N-major ordering: flat_idx = N_row*16 + K_block.
+                    // For (token, scale): N_row = 2*t + (s>=16), K_block = s%16.
+                    // flat_idx = (2t + s/16)*16 + s%16 = 32t + s = source array index.
+                    // Hence layout(t*NUM_SCALES_EACH_TOKEN + s) gives canonical byte offset for scales[t*32+s].
+                    {
+                        auto sfb_layout = SmemLayoutAtomSFB_QK{};
+                        e4m3* dst_base = reinterpret_cast<e4m3*>(&plan.scales[rs.index_buf_idx][0][0]);
+                        CUTE_UNROLL
+                        for (int t = 0; t < 2; ++t) {
+                            int local_token = lane_idx*2 + t;
+                            CUTE_UNROLL
+                            for (int s = 0; s < NUM_SCALES_EACH_TOKEN; ++s) {
+                                int flat_idx = local_token * NUM_SCALES_EACH_TOKEN + s;
+                                int byte_off = sfb_layout(flat_idx);
+                                dst_base[byte_off] = scales[t*NUM_SCALES_EACH_TOKEN + s];
+                            }
+                        }
+                    }
                     *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
                     if (lane_idx%4 == 0)
                         plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;
