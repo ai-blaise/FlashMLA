@@ -61,10 +61,10 @@ python3 tests/nvfp4/bench_nvfp4_vs_fp8.py \
 
 | Batch | Full-NVFP4 min us | FP8 min us | Full-NVFP4 vs FP8 |
 | ---: | ---: | ---: | ---: |
-| 1 | 59.5200 | 59.5197 | 1.0000x |
-| 8 | 65.3957 | 65.1928 | 0.9969x |
-| 32 | 82.6054 | 81.9123 | 0.9916x |
-| 64 | 104.8224 | 104.7213 | 0.9990x |
+| 1 | 59.5232 | 59.5123 | 0.9998x |
+| 8 | 65.6304 | 65.5869 | 0.9993x |
+| 32 | 82.5702 | 82.1062 | 0.9944x |
+| 64 | 104.8762 | 104.7885 | 0.9992x |
 
 IKP SASS metrics showed the original bridge was dominated by scalar byte scale gathering in `csrc/sm100/decode/head64_nvfp4/kernel.cuh`. The current bridge therefore vector-loads the 36 inline E4M3 scale bytes and writes them directly into the shared scale buffer. That removes the local temporary copy and brings the BF16 bridge close to FP8 while preserving the 336-byte full-NVFP4 cache layout.
 
@@ -97,14 +97,25 @@ The native tensor-core rewrite is being landed in compile-safe slices before exe
 
 The staged buffers intentionally do not change the active bridge path yet. The next execution step is to populate the canonical packed K layout from the 336-byte cache rows, quantize the full 576-dim Q tile, move SFA/SFB into TMEM with the block-scaled path, and then replace only V3.2 QK with native NVFP4 tensor cores. PV should keep dequantizing only the first 512 value dimensions after QK consumes the packed K tile.
 
-Latest post-staging bridge regression check:
+Latest post-staging bridge regression check from 2026-06-01:
 
 | Batch | Full-NVFP4 min us | FP8 min us | Full-NVFP4 vs FP8 |
 | ---: | ---: | ---: | ---: |
-| 1 | 59.5672 | 59.5716 | 1.0001x |
-| 8 | 65.3588 | 65.1344 | 0.9966x |
-| 32 | 82.7296 | 81.9552 | 0.9906x |
-| 64 | 104.8634 | 104.9018 | 1.0004x |
+| 1 | 59.5232 | 59.5123 | 0.9998x |
+| 8 | 65.6304 | 65.5869 | 0.9993x |
+| 32 | 82.5702 | 82.1062 | 0.9944x |
+| 64 | 104.8762 | 104.7885 | 0.9992x |
+
+An execution-enabled native QK attempt was compiled and tested after these
+checkpoints, but it was not promoted. The attempt prequantized Q once and staged
+native Q/K tiles in the existing split-K kernel. It exposed a structural shared
+memory lifetime conflict: the old kernel overlays Q, K/V raw bytes, dequantized
+V, and output scratch in the same union because BF16 Q is moved to TMEM before
+K/V staging. Native NVFP4 QK needs Q and packed K resident at the same time as
+the value path, so the next implementation should use an explicit native-QK
+scratch layout instead of reusing the BF16 bridge overlay. A direct
+`cvt.rn.bf16x2.e4m3x2` scale conversion variant was also rejected by CUDA 13.1
+ptxas for this V32 path.
 
 ## Rejected Candidates
 
@@ -115,5 +126,7 @@ Latest post-staging bridge regression check:
 | 48-byte padded shared scale rows with three index buffers | Built, but failed launch because dynamic shared memory exceeded the practical B200 limit |
 | 48-byte padded shared scale rows with two index buffers | Correct but slower: batch 32 `83.00 us` and batch 64 `106.16 us` median |
 | 352-byte production KV row stride | Native-QK scaffold was slightly faster in one cold sweep but tied after warmup; production bridge regressed batch 8 and 32, so 336 bytes remains the production layout |
+| Native QK over the BF16 bridge shared-memory overlay | Compiled after canonical layout fixes but deadlocked or overwrote live scratch; not production-safe without a dedicated native-QK scratch plan |
+| Direct `cvt.rn.bf16x2.e4m3x2` scale conversion in the V32 bridge | Rejected by CUDA 13.1 ptxas with unexpected instruction type errors |
 
 These candidates should not be retried unless the surrounding dequant layout changes substantially.
