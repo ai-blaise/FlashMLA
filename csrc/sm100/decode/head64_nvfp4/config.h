@@ -252,7 +252,12 @@ using TiledMMA_O = decltype(make_tiled_mma(
 ));
 
 // Block-scaled FP4 MMA for S = Q @ K^T (NoPE path). 1-CTA SM100_MMA_MXF4_SS variant.
-// M=B_H*2=128 (dual-GEMM pack), N=B_TOPK*2=128, VS=16 (NVFP4 block size).
+// M=B_H*2=128 (REQUIRED: SM100_MMA_MXF4_SS hard-asserts M==128 for 1-CTA cluster, per
+//   mma_sm100_umma.hpp:1360). N=B_TOPK*2=128 (dual-gemm pack on N side).
+// 1-CTA M=64 attempt failed at static_assert; either use 2x1SM_SS variant for 2-CTA cluster
+//   (= M=128 distributed as 64/CTA, kernel architectural change), OR keep M=128 and ensure
+//   raw_nope + q_fp4 SMEM hold 2 tiles each (current allocation is 1 tile → undersized for MMA).
+// Phase 4-blocker: raw_nope is B_H*D_NOPE/2 = 16K bytes per buf; need 2x for M=128 dual-gemm.
 // Scale-factor type is ue4m3 (unsigned E4M3, the type required by CUTLASS NVFP4 traits).
 using TiledMMA_S_NVFP4 = decltype(make_tiled_mma(
     cute::SM100_MMA_MXF4_SS<
@@ -260,8 +265,8 @@ using TiledMMA_S_NVFP4 = decltype(make_tiled_mma(
         e2m1,       // B: NVFP4
         float,      // C: FP32
         ue4m3,      // SF: UE4M3
-        B_H*2,      // M = 128 (dual-gemm pack)
-        B_TOPK*2,   // N = 128
+        B_H*2,      // M = 128 (HW-required for 1-CTA MXF4_SS)
+        B_TOPK*2,   // N = 128 (dual-gemm pack)
         16,         // VS = NVFP4 vector size
         UMMA::Major::K, UMMA::Major::K
     >{}
