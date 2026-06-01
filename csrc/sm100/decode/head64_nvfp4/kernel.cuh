@@ -584,9 +584,11 @@ KernelTemplate<MODEL_TYPE>
                 }
             });
         } else if (warp_idx == 5 && elect_one_sync()) {
-            // Raw KV NoPE retrieval warp
+            // Raw KV NoPE retrieval warp.
+            // raw_nope SMEM lives at the high end of the qo/kv union and does not alias the BF16 Q SMEM
+            // that the MMA warp is filling via Q TMA + UTCCP at kernel start. Skip the q_utccp wait so the
+            // very first block's K data can start fetching in parallel with Q setup.
             run_main_loop([&](const MainLoopArgs &args) {
-                plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
                 plan.bar_last_store_done.wait(args.bar_phase_batch_rel);
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
