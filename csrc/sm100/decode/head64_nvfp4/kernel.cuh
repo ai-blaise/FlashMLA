@@ -6,6 +6,7 @@
 #include <cutlass/arch/reg_reconfig.h>
 #include <cute/tensor.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
+#include <cutlass/numeric_conversion.h>
 
 #include "kerutils/kerutils.cuh"
 
@@ -903,28 +904,52 @@ KernelTemplate<MODEL_TYPE>
             // plan.bar_last_store_done.wait(args.bar_phase_batch_rel); // No need to wait since the raw nope producer must wait
             plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
 
-            // Phase 3: In-kernel BF16→NVFP4 Q quant scaffolding (one-shot per batch).
-            // Writes PLACEHOLDER values to plan.u.qo.o.fp4.q_fp4 / q_scales so the FP4 MMA has
-            // non-zero data to consume. PTX cvt.rn.satfinite.{e2m1x2,ue4m3x2}.f32 deferred — initial
-            // attempt hit "Arguments mismatch" at ptxas (CTK 13 PTX version compatibility).
-            // Real quant (Phase 3b): reads BF16 from plan.u.qo.q via SmemLayoutQ_SW128 view.
-            // Real layouts (Phases 4-5): canonical Sm1xxBlockScaledConfig SF + SW128-swizzled FP4.
-            // Implicit sync: warp 4's FP4 MMA waits on bar_nope_ready downstream of this.
+            // Phase 3b: Real in-kernel BF16→NVFP4 Q quant via CUTLASS NumericConverter helpers.
+            // PTX inline asm cvt.rn.satfinite.{e2m1x2,e4m3x2}.f32 failed in our PTX 9.2 / ptxas 13.3
+            // environment with "Arguments mismatch" — likely arch/version constraints not satisfied.
+            // CUTLASS NumericConverter wraps the right intrinsic with version handling.
+            // 128 threads × 16 blocks each = 2048 quant blocks (64 rows × 32 scale-blocks/row).
             if constexpr (MODEL_TYPE == ModelType::V32) {
-                // 128 threads write placeholder Q FP4 + scales.
-                // q_fp4: B_H*D_NOPE/2 = 16384 bytes. 128 threads * 128 bytes = 16384.
-                constexpr int bytes_per_thread = (B_H * D_NOPE / 2) / 128;  // 128
+                Tensor sQ_bf16 = make_tensor(make_smem_ptr(plan.u.qo.q.data()), SmemLayoutQ_SW128{});
+                using FP4Conv = cutlass::NumericConverter<e2m1, float>;
+                using SFConv  = cutlass::NumericConverter<ue4m3, float>;
+                constexpr int blocks_per_thread = (B_H * NUM_SCALES_EACH_TOKEN) / 128;
                 CUTE_UNROLL
-                for (int i = 0; i < bytes_per_thread / 8; ++i) {
-                    uint64_t* dst = (uint64_t*)(plan.u.qo.o.fp4.q_fp4.data() + idx_in_warpgroup * bytes_per_thread + i * 8);
-                    *dst = 0x4444444444444444ULL;  // packed e2m1 value 4 (= 2.0 in NVFP4 grid)
-                }
-                // q_scales: 64 rows * 32 scales = 2048 bytes. 128 threads * 16 bytes = 2048.
-                constexpr int scale_bytes_per_thread = (B_H * NUM_SCALES_EACH_TOKEN) / 128;  // 16
-                CUTE_UNROLL
-                for (int i = 0; i < scale_bytes_per_thread / 8; ++i) {
-                    uint64_t* dst = (uint64_t*)((uint8_t*)&plan.u.qo.o.fp4.q_scales[0][0] + idx_in_warpgroup * scale_bytes_per_thread + i * 8);
-                    *dst = 0x3C3C3C3C3C3C3C3CULL;  // ue4m3 = 0x3C ≈ 1.0
+                for (int b = 0; b < blocks_per_thread; ++b) {
+                    int block_idx_q = b * 128 + idx_in_warpgroup;
+                    int row = block_idx_q / NUM_SCALES_EACH_TOKEN;
+                    int col_block = block_idx_q % NUM_SCALES_EACH_TOKEN;
+                    int col_base = col_block * 16;
+
+                    float v[16];
+                    float absmax = 0.0f;
+                    CUTE_UNROLL
+                    for (int i = 0; i < 16; ++i) {
+                        v[i] = (float)sQ_bf16(row, col_base + i);
+                        absmax = fmaxf(absmax, fabsf(v[i]));
+                    }
+                    float scale_f32 = fmaxf(absmax / 6.0f, 1e-6f);
+                    float inv_scale = 1.0f / scale_f32;
+
+                    // Quantize 16 BF16 → 8 bytes via CUTLASS NumericConverter
+                    uint8_t fp4_bytes[8];
+                    CUTE_UNROLL
+                    for (int i = 0; i < 8; ++i) {
+                        e2m1 e2m1_lo = FP4Conv::convert(v[i*2]   * inv_scale);
+                        e2m1 e2m1_hi = FP4Conv::convert(v[i*2+1] * inv_scale);
+                        uint8_t raw_lo = *reinterpret_cast<uint8_t*>(&e2m1_lo) & 0x0F;
+                        uint8_t raw_hi = *reinterpret_cast<uint8_t*>(&e2m1_hi) & 0x0F;
+                        fp4_bytes[i] = (raw_hi << 4) | raw_lo;
+                    }
+
+                    // Scale: f32 → ue4m3
+                    ue4m3 scale_e4m3 = SFConv::convert(scale_f32);
+                    uint8_t scale_byte = *reinterpret_cast<uint8_t*>(&scale_e4m3);
+
+                    // FLAT writes (Phase 5 for swizzle, Phase 4 cont'd for SF canonical)
+                    uint64_t* q_fp4_dst = (uint64_t*)(plan.u.qo.o.fp4.q_fp4.data() + row * (D_NOPE/2) + col_block * 8);
+                    *q_fp4_dst = *(uint64_t*)fp4_bytes;
+                    *reinterpret_cast<uint8_t*>(&plan.u.qo.o.fp4.q_scales[row][col_block]) = scale_byte;
                 }
                 __syncwarp();
             }
