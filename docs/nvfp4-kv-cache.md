@@ -19,7 +19,7 @@ The V3.2 path ignores the legacy `kv_scales` tensor. MODEL1 keeps the older spli
 
 The production bridge gathers the 336-byte token records, dequantizes packed FP4 score data to BF16 shared memory, and then uses the existing BF16 FlashMLA QK/PV pipeline. This validates the full-NVFP4 cache representation and API plumbing, but it does not yet use native NVFP4 tensor-core QK.
 
-The separate CuTe scaffold `flash_mla/cute_dsl/test_nvfp4_mla_qk_full_nvfp4_scaffold.py` validates the intended native-QK primitive at the target shape: `M=128`, `N=1024`, `K=576`, with RoPE included in NVFP4.
+The separate CuTe scaffold `flash_mla/cute_dsl/test_nvfp4_mla_qk_full_nvfp4_scaffold.py` validates the intended native-QK primitive at the target shape: `M=128`, `N=1024`, `K=576`, with RoPE included in NVFP4. The in-kernel head64 path uses the legal production tile shape `M=128`, `N=64`, `K=576`; rows `64..127` are padded in Q because Blackwell `SM100_MMA_MXF4_SS` requires `M=128`, while `N=64` is legal.
 
 ## Verification
 
@@ -96,8 +96,13 @@ The native tensor-core rewrite is being landed in compile-safe slices before exe
 | --- | --- | --- |
 | Native layout aliases | `36f6cb6` | Adds the SM100 MXF4/NVF4 MMA atom, K-major Q/K shared-memory layouts, and canonical SFA/SFB layouts. Execution-neutral. |
 | Native staging storage | `1e48178` | Reserves Q/K packed FP4 and scale-factor scratch in existing shared-memory lifetimes. Execution-neutral. |
+| Native-Q prequant scaffold | `720a21f` | Adds the standalone V3.2 Q prequant kernel for the legal 128-row native Q operand, fixes native QK `N=64`, and proves the dedicated native-QK SMEM plan fits B200 (`231680` bytes). Execution-neutral. |
 
-The staged buffers intentionally do not change the active bridge path yet. The next execution step is to populate the canonical packed K layout from the 336-byte cache rows, quantize the full 576-dim Q tile, move SFA/SFB into TMEM with the block-scaled path, and then replace only V3.2 QK with native NVFP4 tensor cores. PV should keep dequantizing only the first 512 value dimensions after QK consumes the packed K tile.
+The staged buffers intentionally do not change the active bridge path yet. The next execution step is to populate the canonical packed K layout from the 336-byte cache rows, move SFA/SFB into TMEM with the block-scaled path, and then replace only V3.2 QK with native NVFP4 tensor cores. PV should keep dequantizing only the first 512 value dimensions after QK consumes the packed K tile.
+
+The native-Q prequant scaffold writes one 128-row Q operand per head64 block: rows `0..63` are quantized from BF16 Q, rows `64..127` are explicit zero padding, and all `128*36` E4M3 scale bytes are initialized. B200 smoke command used during this slice compiled `/tmp/qprequant_smoke.cu` against `q_prequant.cu` and reported `nonzero_real=36864`, `nonzero_pad=0`, `untouched_pad=0`, `scale_untouched=0`.
+
+The dedicated native-QK shared-memory plan is intentionally separate from the BF16 bridge overlay. Its compile-time size is `231680` bytes, under the observed B200 opt-in limit of `232448` bytes. The existing bridge plan remains `231632` bytes.
 
 Latest post-staging bridge regression check from 2026-06-01:
 

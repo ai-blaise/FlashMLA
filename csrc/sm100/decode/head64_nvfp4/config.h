@@ -54,6 +54,11 @@ static constexpr int B_H = 64;
 static constexpr int B_TOPK = 64;
 static constexpr int NVFP4_DUAL_QK_PACKED_BYTES = B_H * NVFP4_SCORE_BYTES * 2;
 static constexpr int NVFP4_DUAL_QK_SCALE_BYTES = B_TOPK * NUM_SCALES_EACH_TOKEN * 2;
+static constexpr int NVFP4_NATIVE_Q_PACKED_BYTES = NVFP4_DUAL_QK_PACKED_BYTES;
+static constexpr int NVFP4_NATIVE_Q_SCALE_BYTES = NVFP4_DUAL_QK_SCALE_BYTES;
+static constexpr int NVFP4_NATIVE_K_PACKED_BYTES = B_TOPK * NVFP4_SCORE_BYTES;
+static constexpr int NVFP4_NATIVE_K_SCALE_BYTES = NVFP4_DUAL_QK_SCALE_BYTES;
+static constexpr int NUM_NATIVE_INDEX_BUFS = 2;
 static constexpr int NUM_BUFS = 2;
 static constexpr int NUM_INDEX_BUFS = 3;  // NVFP4: reduced from 4 to fit SMEM (32 scales/token expands SMEM)
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
@@ -166,6 +171,43 @@ using SmemLayoutKTilesTransposed_SW64 = decltype(composition(
     >{}
 ));
 
+struct NativeQKSharedMemoryPlan {
+    struct NativeMainloopScratch {
+        struct {
+            array_aligned<uint8_t, NVFP4_NATIVE_Q_PACKED_BYTES, 128> q;
+            CUTE_ALIGNAS(16) uint8_t scales[NVFP4_NATIVE_Q_SCALE_BYTES];
+        } q;
+        struct Buffer {
+            union {
+                struct {
+                    array_aligned<uint8_t, NVFP4_NATIVE_K_PACKED_BYTES, 128> k;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_NATIVE_K_SCALE_BYTES];
+                } native_k;
+                array_aligned<bf16, B_TOPK*D_V> v;
+            } decoded;
+            array_aligned<uint8_t, B_TOPK*NVFP4_SCORE_BYTES, 128> raw;
+        } kv[NUM_BUFS];
+    } mainloop;
+    union {
+        float4 p_exchange_buf[4][16 * B_TOPK / 4];
+        array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    } s_p;
+    CUTE_ALIGNAS(16) float rowwise_max_buf[128];
+    char is_token_valid[NUM_NATIVE_INDEX_BUFS][B_TOPK/8];
+    CUTE_ALIGNAS(16) int tma_coord[NUM_NATIVE_INDEX_BUFS][B_TOPK];
+    CUTE_ALIGNAS(16) e4m3 scales[NUM_NATIVE_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];
+    array_aligned<uint32_t, 1> tmem_start_addr;
+    transac_bar_t bar_last_store_done;
+    transac_bar_t bar_q_native_ready;
+    transac_bar_t bar_k_native_ready[NUM_BUFS];
+    transac_bar_t bar_v_ready[NUM_BUFS];
+    transac_bar_t bar_raw_ready[NUM_BUFS], bar_raw_free[NUM_BUFS];
+    transac_bar_t bar_valid_coord_scale_ready[NUM_NATIVE_INDEX_BUFS], bar_valid_coord_scale_free[NUM_NATIVE_INDEX_BUFS];
+    transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
+};
+static_assert(sizeof(NativeQKSharedMemoryPlan) < 232448,
+              "Native NVFP4 QK shared-memory plan must fit B200 opt-in SMEM");
+
 struct SharedMemoryPlan {
     union {
         struct {
@@ -224,7 +266,7 @@ using TiledMMA_O = decltype(make_tiled_mma(
 
 static constexpr int NVFP4_SF_VEC = 16;
 static constexpr int NVFP4_QK_M = B_H * 2;
-static constexpr int NVFP4_QK_N = B_TOPK * 2;
+static constexpr int NVFP4_QK_N = B_TOPK;
 static constexpr int NVFP4_QK_K = D_Q;
 
 using TiledMMA_QK_NVFP4 = decltype(make_tiled_mma(
