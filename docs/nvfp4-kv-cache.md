@@ -73,7 +73,7 @@ The bridge reduces cache bytes from 656 bytes/token in the FP8 V3.2 layout to 33
 
 ### Native QK Cache-Row Scaffold
 
-After the bridge checkpoint, the CuTe full-NVFP4 QK scaffold was tightened to support `--cache-layout`. In that mode the K operand is read from the real 336-byte KV cache row layout, with a 672-FP4-element row stride that skips the inline scales and padding rather than repacking K into a dense matrix.
+After the bridge checkpoint, the CuTe full-NVFP4 QK scaffold was tightened to support `--cache-layout`. In that mode the K operand is read from the real KV cache row layout, with a configurable row stride that skips the inline scales and padding rather than repacking K into a dense matrix.
 
 ```bash
 python3 flash_mla/cute_dsl/test_nvfp4_mla_qk_full_nvfp4_scaffold.py \
@@ -82,7 +82,9 @@ python3 flash_mla/cute_dsl/test_nvfp4_mla_qk_full_nvfp4_scaffold.py \
   --bench
 ```
 
-Observed on B200 after recheck: exact QK score tile, exact 512-dim value contract, and `39.13 us` for `M=128`, `N=1024`, `K=576`. This is slower than the same-run dense packed scaffold (`31.35 us`) but is the correct native-QK baseline because it exercises the production KV row stride.
+Observed on B200 after recheck: exact QK score tile, exact 512-dim value contract, and `29.73 us` for `M=128`, `N=1024`, `K=576` with a 352-byte row-stride candidate. The same cold sweep measured `30.67 us` at 336 bytes, `32.01 us` at 384 bytes, and `32.01 us` at 512 bytes.
+
+A follow-up same-container repeat showed `336` and `352` byte rows converge after warmup, with `336` slightly ahead on the final repeat (`24.48 us` versus `25.03 us`). The 352-byte production bridge also regressed batch 8 and batch 32 and costs more memory. The production row stride therefore remains 336 bytes until a native decode integration proves a stable end-to-end win for a wider row.
 
 ## Rejected Candidates
 
@@ -92,5 +94,6 @@ Observed on B200 after recheck: exact QK score tile, exact 512-dim value contrac
 | `GROUP_SIZE=4` dequant ownership | Failed all-ones correctness with output mean about `0.5` |
 | 48-byte padded shared scale rows with three index buffers | Built, but failed launch because dynamic shared memory exceeded the practical B200 limit |
 | 48-byte padded shared scale rows with two index buffers | Correct but slower: batch 32 `83.00 us` and batch 64 `106.16 us` median |
+| 352-byte production KV row stride | Native-QK scaffold was slightly faster in one cold sweep but tied after warmup; production bridge regressed batch 8 and 32, so 336 bytes remains the production layout |
 
 These candidates should not be retried unless the surrounding dequant layout changes substantially.

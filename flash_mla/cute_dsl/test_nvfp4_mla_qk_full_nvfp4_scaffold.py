@@ -554,7 +554,7 @@ def nvfp4_quantize(t_bf16: torch.Tensor, sf_vec: int = 16):
     return q_fp4_val.view(*batch, K).contiguous(), sf_e4m3.contiguous()
 
 
-def run_test(bench=False, topk=128, cache_layout=False):
+def run_test(bench=False, topk=128, cache_layout=False, cache_row_bytes=336):
     device = torch.device("cuda")
     m, n, k = B_H, topk, D_QK_LATENT
     # Round up problem to MMA tile multiples for the validator (smallest legal tile)
@@ -617,13 +617,15 @@ def run_test(bench=False, topk=128, cache_layout=False):
 
     kv_cache = None
     if cache_layout:
-        kv_cache = torch.zeros(n_pad, 336, dtype=torch.uint8, device=device)
+        if cache_row_bytes < 324:
+            raise ValueError("cache_row_bytes must fit 288 score bytes and 36 scale bytes")
+        kv_cache = torch.zeros(n_pad, cache_row_bytes, dtype=torch.uint8, device=device)
         kv_cache[:, :288] = K_packed
         kv_cache[:, 288:324] = K_sf.to(torch.float8_e4m3fn).view(torch.uint8)
         k_storage = kv_cache
-        b_row_stride_fp4 = 336 * 2
+        b_row_stride_fp4 = cache_row_bytes * 2
         K_sf_source = kv_cache[:, 288:324].view(torch.float8_e4m3fn).float()
-        print("Using real 336-byte cache-row layout for K operand")
+        print(f"Using {cache_row_bytes}-byte cache-row layout for K operand")
     else:
         k_storage = K_packed
         b_row_stride_fp4 = k
@@ -783,5 +785,11 @@ if __name__ == "__main__":
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--topk", type=int, default=128)
     parser.add_argument("--cache-layout", action="store_true")
+    parser.add_argument("--cache-row-bytes", type=int, default=336)
     args = parser.parse_args()
-    run_test(bench=args.bench, topk=args.topk, cache_layout=args.cache_layout)
+    run_test(
+        bench=args.bench,
+        topk=args.topk,
+        cache_layout=args.cache_layout,
+        cache_row_bytes=args.cache_row_bytes,
+    )
