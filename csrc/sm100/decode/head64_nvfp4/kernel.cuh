@@ -645,13 +645,12 @@ KernelTemplate<MODEL_TYPE>
                         ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
 
                         // QK NoPE (FP4) — Phase 1 of C++ FP4 MMA path.
-                        // Replaces BF16 NoPE MMA. Reads raw FP4 K from plan.u.kv.raw_nope (skipping WG2 dequant for NoPE),
-                        // Q FP4 from plan.u.qo.o.fp4.q_fp4, scales via TMEM (Q-SF preloaded by once-before-loop block,
-                        // K-SF UTCCP'd per-block). Accumulates on RoPE's tP via ScaleOut::One.
+                        // Phase 4 cont v6: DEBUG — wrap in if constexpr (false) to isolate FP4 MMA.
+                        // If hang persists, cause is elsewhere. If hang resolves, FP4 MMA is the issue.
                         plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
                         plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
                         ku::tcgen05_after_thread_sync();
-                        {
+                        if constexpr (false) {
                             TiledMMA tiled_mma_S_loop = TiledMMA_S_NVFP4{};
                             Tensor sQ_fp4_loop = make_tensor(
                                 make_smem_ptr(reinterpret_cast<e2m1*>(plan.u.qo.o.fp4.q_fp4.data())),
