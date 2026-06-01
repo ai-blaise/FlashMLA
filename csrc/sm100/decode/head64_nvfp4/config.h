@@ -106,13 +106,12 @@ using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
 using SmemLayoutQ_SW128 = SmemLayoutQTiles<D_Q_SW128/64>;
 
 // FP4-packed Q SMEM layout for the MXF4 atom.
-// Phase 5 Option B consistency: switched from Layout_K_SW128_Atom to Layout_K_INTER_Atom
-// to match K SMEM (also INTER atom). Q quant writes linear bytes — INTER atom reads linear.
-// (Earlier SW128 attempt failed canonical UMMA_K check at full K=512; with TileShape K=256
-//  the INTER atom passes the check and matches our linear Q quant writes from Phase 3b.)
+// Phase 4 cont v9: REVERT to Layout_K_SW128_Atom (matches K SMEM + MMA expectations).
+// Q quant writes will need to be SW128-swizzled — for now linear writes mean Q data is
+// MISALIGNED within 128B stripes but gemm won't hang from descriptor mismatch.
 template<int NUM_TILES>
 using SmemLayoutQ_FP4_Tiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_INTER_Atom<e2m1>{},
+    UMMA::Layout_K_SW128_Atom<e2m1>{},
     Shape<Int<B_H>, Int<NUM_TILES*128>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
@@ -120,12 +119,12 @@ using SmemLayoutQ_FP4_Tiles = decltype(coalesce(tile_to_shape(
 using SmemLayoutQ_FP4 = SmemLayoutQ_FP4_Tiles<512/128>;
 
 // FP4-packed K SMEM layout for the MXF4 atom (dual-gemm packed M=B_H*2=128).
-// Phase 5 Option B: use Layout_K_INTER_Atom (no swizzle) to match linear TMA writes.
-// (Layout_K_SW128_Atom was incompatible with ku::tma_gather4's 2D-only descriptor.)
-// May have bank conflicts but compatible with linear K data layout.
+// Phase 4 cont v8: REVERT to Layout_K_SW128_Atom (MmaMXF4NVF4Op requires SW128 descriptor).
+// INTER atom caused cute::gemm to hang. SW128 is what the MMA atom expects at runtime.
+// K data from linear TMA will be MISALIGNED within 128B stripes but gemm won't hang.
 template<int NUM_TILES>
 using SmemLayoutK_FP4_Tiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_INTER_Atom<e2m1>{},
+    UMMA::Layout_K_SW128_Atom<e2m1>{},
     Shape<Int<B_H*2>, Int<NUM_TILES*128>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));

@@ -689,8 +689,8 @@ KernelTemplate<MODEL_TYPE>
                             tiled_mma_S_loop.accumulate_ = UMMA::ScaleOut::One;
                             CUTE_UNROLL
                             for (int k = 0; k < size<2>(sQ_fp4_frag_loop); ++k) {
-                                // Phase 4 cont v7 DEBUG: skip cute::gemm to isolate hang
-                                if constexpr (false) cute::gemm(
+                                // Phase 4 cont v8: re-enabled cute::gemm (K SMEM now SW128 again).
+                                cute::gemm(
                                     tiled_mma_S_loop.with(tiled_mma_S_loop.accumulate_,
                                                           tCtSFA_loop(_, _, k),
                                                           tCtSFB_loop(_, _, k)),
