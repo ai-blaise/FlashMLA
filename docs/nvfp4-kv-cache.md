@@ -70,7 +70,6 @@ IKP SASS metrics showed the original bridge was dominated by scalar byte scale g
 
 The bridge reduces cache bytes from 656 bytes/token in the FP8 V3.2 layout to 336 bytes/token. The remaining gap is now small but still exists at batch 8 and 32, so the next required optimization remains native NVFP4 tensor-core QK using the validated CuTe/CZS scaffold layout rather than more BF16 bridge polishing.
 
-
 ### Native QK Cache-Row Scaffold
 
 After the bridge checkpoint, the CuTe full-NVFP4 QK scaffold was tightened to support `--cache-layout`. In that mode the K operand is read from the real KV cache row layout, with a configurable row stride that skips the inline scales and padding rather than repacking K into a dense matrix.
@@ -85,6 +84,27 @@ python3 flash_mla/cute_dsl/test_nvfp4_mla_qk_full_nvfp4_scaffold.py \
 Observed on B200 after recheck: exact QK score tile, exact 512-dim value contract, and `29.73 us` for `M=128`, `N=1024`, `K=576` with a 352-byte row-stride candidate. The same cold sweep measured `30.67 us` at 336 bytes, `32.01 us` at 384 bytes, and `32.01 us` at 512 bytes.
 
 A follow-up same-container repeat showed `336` and `352` byte rows converge after warmup, with `336` slightly ahead on the final repeat (`24.48 us` versus `25.03 us`). The 352-byte production bridge also regressed batch 8 and batch 32 and costs more memory. The production row stride therefore remains 336 bytes until a native decode integration proves a stable end-to-end win for a wider row.
+
+
+### Native QK Integration Checkpoints
+
+The native tensor-core rewrite is being landed in compile-safe slices before execution is switched over:
+
+| Checkpoint | Commit | Status |
+| --- | --- | --- |
+| Native layout aliases | `36f6cb6` | Adds the SM100 MXF4/NVF4 MMA atom, K-major Q/K shared-memory layouts, and canonical SFA/SFB layouts. Execution-neutral. |
+| Native staging storage | `1e48178` | Reserves Q/K packed FP4 and scale-factor scratch in existing shared-memory lifetimes. Execution-neutral. |
+
+The staged buffers intentionally do not change the active bridge path yet. The next execution step is to populate the canonical packed K layout from the 336-byte cache rows, quantize the full 576-dim Q tile, move SFA/SFB into TMEM with the block-scaled path, and then replace only V3.2 QK with native NVFP4 tensor cores. PV should keep dequantizing only the first 512 value dimensions after QK consumes the packed K tile.
+
+Latest post-staging bridge regression check:
+
+| Batch | Full-NVFP4 min us | FP8 min us | Full-NVFP4 vs FP8 |
+| ---: | ---: | ---: | ---: |
+| 1 | 59.5672 | 59.5716 | 1.0001x |
+| 8 | 65.3588 | 65.1344 | 0.9966x |
+| 32 | 82.7296 | 81.9552 | 0.9906x |
+| 64 | 104.8634 | 104.9018 | 1.0004x |
 
 ## Rejected Candidates
 
