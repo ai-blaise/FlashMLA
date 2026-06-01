@@ -278,8 +278,10 @@ using TiledMMA_S_NVFP4 = decltype(make_tiled_mma(
 // Replaces the flat layouts that hit "Expected an MMA-SF partitioned tensor".
 // SFVecSize=16 matches NVFP4 QUANT_TILE_SIZE.
 using Sm100BlockScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
-// MMA tile shape for QK NoPE GEMM: M=B_H*2=128, N=B_TOPK*2=128, K=D_NOPE=512.
-using TileShape_QK_FP4 = Shape<Int<B_H*2>, Int<B_TOPK*2>, Int<D_NOPE>>;
+// MMA tile shape for QK NoPE GEMM: M=B_H*2=128, N=B_TOPK*2=128, K=D_NOPE/2=256.
+// Phase 4 fix: K matches dual-gemm packed K (D_NOPE/2), not full D_NOPE.
+// This sizes canonical SF layouts to 2048 bytes per buf, matching plan.scales[buf_idx] size.
+using TileShape_QK_FP4 = Shape<Int<B_H*2>, Int<B_TOPK*2>, Int<D_NOPE/2>>;
 using SmemLayoutAtomSFA_QK = decltype(Sm100BlockScaledConfig::deduce_smem_layoutSFA(
     TiledMMA_S_NVFP4{}, TileShape_QK_FP4{}));
 using SmemLayoutAtomSFB_QK = decltype(Sm100BlockScaledConfig::deduce_smem_layoutSFB(
