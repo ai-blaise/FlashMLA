@@ -4,6 +4,7 @@
 
 #include <cuda_fp8.h>
 #include <cutlass/barrier.h>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cute/tensor.hpp>
 
 #include <kerutils/kerutils.cuh>
@@ -17,6 +18,8 @@ using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using e8m0 = __nv_fp8_e8m0;
 using e4m3 = cutlass::float_e4m3_t;
+using e2m1 = cutlass::float_e2m1_t;
+using ue4m3 = cutlass::float_ue4m3_t;
 using namespace cute;
 
 enum NamedBarriers : uint32_t {
@@ -206,6 +209,45 @@ using TiledMMA_P = decltype(make_tiled_mma(
 using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{}
 ));
+
+static constexpr int NVFP4_SF_VEC = 16;
+static constexpr int NVFP4_QK_M = B_H * 2;
+static constexpr int NVFP4_QK_N = B_TOPK * 2;
+static constexpr int NVFP4_QK_K = D_Q;
+
+using TiledMMA_QK_NVFP4 = decltype(make_tiled_mma(
+    SM100_MMA_MXF4_SS<
+        e2m1,
+        e2m1,
+        float,
+        ue4m3,
+        NVFP4_QK_M,
+        NVFP4_QK_N,
+        NVFP4_SF_VEC,
+        UMMA::Major::K,
+        UMMA::Major::K>{}
+));
+
+using TileShapeQKNVFP4 = Shape<Int<NVFP4_QK_M>, Int<NVFP4_QK_N>, Int<NVFP4_QK_K>>;
+using MmaShapeAQKNVFP4 = decltype(partition_shape_A(
+    TiledMMA_QK_NVFP4{}, Shape<Int<NVFP4_QK_M>, Int<NVFP4_QK_K>>{}));
+using MmaShapeBQKNVFP4 = decltype(partition_shape_B(
+    TiledMMA_QK_NVFP4{}, Shape<Int<NVFP4_QK_N>, Int<NVFP4_QK_K>>{}));
+
+using SmemLayoutQNVFP4 = decltype(UMMA::tile_to_mma_shape(
+    UMMA::Layout_K_SW32_Atom<e2m1>{},
+    append(MmaShapeAQKNVFP4{}, _1{}),
+    Step<_1, _2, _3>{}));
+using SmemLayoutKNVFP4 = decltype(UMMA::tile_to_mma_shape(
+    UMMA::Layout_K_SW32_Atom<e2m1>{},
+    append(MmaShapeBQKNVFP4{}, _1{}),
+    Step<_1, _2, _3>{}));
+
+using NVFP4QKScaleLayout = cutlass::detail::Sm1xxBlockScaledConfig<NVFP4_SF_VEC>;
+using SmemLayoutQScaleNVFP4 = decltype(
+    NVFP4QKScaleLayout::deduce_smem_layoutSFA(TiledMMA_QK_NVFP4{}, TileShapeQKNVFP4{}));
+using SmemLayoutKScaleNVFP4 = decltype(
+    NVFP4QKScaleLayout::deduce_smem_layoutSFB(TiledMMA_QK_NVFP4{}, TileShapeQKNVFP4{}));
 
 template<typename TmaParam>
 static __device__ void
