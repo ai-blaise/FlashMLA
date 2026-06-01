@@ -538,7 +538,11 @@ KernelTemplate<MODEL_TYPE>
                 //   only for the BF16 RoPE path. The in-kernel BF16 -> FP4 quant
                 //   that populates plan.u.qo.o.fp4.q_fp4 / q_scales is deferred to
                 //   commit 3; commit 4 moves it host-side.
-                if constexpr (true) {
+                // Phase 4 cont v5: disable once-before-loop FP4 MMA (was constexpr true since 585a01c).
+                // Per-block FP4 MMA in main loop (Phase 1) handles all FP4 work properly with
+                // valid Q SF/data. The once-before-loop block ran with UNINITIALIZED q_scales
+                // (WG2 quant happens in parallel) which polluted TMEM SFA_Q + SFB_K regions.
+                if constexpr (false) {
                     TiledMMA tiled_mma_S = TiledMMA_S_NVFP4{};
 
                     // ---- FP4 Q (SMEM) + FP4 K (raw_nope as e2m1) ----
@@ -975,7 +979,9 @@ KernelTemplate<MODEL_TYPE>
                         reinterpret_cast<uint8_t*>(&plan.u.qo.o.fp4.q_scales[0][0])[byte_off] = scale_byte;
                     }
                 }
-                __syncwarp();
+                // Phase 4 cont v4: WG2 warpgroup-level sync to ensure all 128 threads
+                // finish Q quant before any proceeds to dequant (and before warp 4 reads sQ_fp4).
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg2_sync);
             }
 
             CUTE_NO_UNROLL

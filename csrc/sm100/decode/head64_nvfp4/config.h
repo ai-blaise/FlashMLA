@@ -27,7 +27,8 @@ enum NamedBarriers : uint32_t {
     wg0_sync = 1,
     wg0_warp02_sync = 2,
     wg0_warp13_sync = 3,
-    everyone_sync = 4
+    everyone_sync = 4,
+    wg2_sync = 5    // Phase 4 cont v4: WG2 warpgroup-level sync (Q quant completion)
 };
 
 template<ModelType MODEL_TYPE>
