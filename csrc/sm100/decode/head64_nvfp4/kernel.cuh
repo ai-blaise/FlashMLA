@@ -1150,19 +1150,20 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
         static_assert(D_NOPE%8 == 0);
         KU_ASSERT((int64_t)k_ptr % 16 == 0, "The base address of %sk_ptr (%p) must be 16B aligned for sparse fp8 attention on sm100f", is_extra?"extra_":"", k_ptr);
         KU_ASSERT(k_batch_stride % TMA_K_STRIDE == 0, "%sk_cache.stride(0) (%ld) must be a multiple of %d. Padding might be necessary", is_extra?"extra_":"", k_batch_stride, TMA_K_STRIDE);
-        // Phase 5 REVERTED (debugging): back to INT64+SWIZZLE_NONE to isolate combine.cu:197 illegal instruction.
-        // Original (iter11) pattern. Consumer (SmemLayoutK_FP4 = Layout_K_SW128_Atom<e2m1>) expects
-        // SW128 swizzle but TMA writes linear. Mismatch is one of the correctness sources but
-        // doesn't cause the illegal instruction (verified by this revert test).
+        // Phase 5: Switch from INT64+SWIZZLE_NONE to UINT8+SWIZZLE_128B for FP4 K nope.
+        // SWIZZLE_128B requires boxDim[0]*sizeof(elem) == 128 bytes.
+        // For UINT8: boxDim[0] must equal 128. Each FP4 token is D_NOPE/2=256 bytes = 2 stripes.
+        // So tensor must be 3D: (intra-stripe=128, num-stripes-per-token, num-token-rows).
+        // Box = (128, 2, 1) reads ONE token's 256 bytes per call, swizzled within each 128B half.
         CUtensorMap tensor_map_kv_nope = ku::make_tensor_map(
-            {(D_NOPE/2)/8, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
-            {TMA_K_STRIDE},
-            {(D_NOPE/2)/8, 1},
+            {128, (D_NOPE/2)/128, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
+            {128, TMA_K_STRIDE},
+            {128, (D_NOPE/2)/128, 1},
             k_ptr,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
-        );  // NOTE We combine 8 float8 into 1 int64 since boxdim cannot > 256
+        );  // Phase 5: UINT8 + SW128, 3D descriptor for FP4 K nope with intra-token stripe split
         CUtensorMap tensor_map_kv_rope = ku::make_tensor_map(
             {D_ROPE, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
             {TMA_K_STRIDE},
