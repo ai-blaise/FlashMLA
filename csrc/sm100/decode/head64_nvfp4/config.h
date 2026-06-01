@@ -119,12 +119,12 @@ using SmemLayoutQ_FP4_Tiles = decltype(coalesce(tile_to_shape(
 using SmemLayoutQ_FP4 = SmemLayoutQ_FP4_Tiles<512/128>;
 
 // FP4-packed K SMEM layout for the MXF4 atom (dual-gemm packed M=B_H*2=128).
-// Mirrors SmemLayoutKTiles_DualGemm_SW128's pattern: BF16 uses D_NOPE/atom_K/2 = 512/64/2 = 4 tiles
-// where /2 is the dual-gemm K-half factor. FP4 mirror: D_NOPE/atom_K(=128)/2 = 512/128/2 = 2 tiles.
-// Total: Shape<128 N, 2*128=256 K_packed> = 32K e2m1 = 16K bytes = matches raw_nope size.
+// Phase 5 Option B: use Layout_K_INTER_Atom (no swizzle) to match linear TMA writes.
+// (Layout_K_SW128_Atom was incompatible with ku::tma_gather4's 2D-only descriptor.)
+// May have bank conflicts but compatible with linear K data layout.
 template<int NUM_TILES>
 using SmemLayoutK_FP4_Tiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<e2m1>{},
+    UMMA::Layout_K_INTER_Atom<e2m1>{},
     Shape<Int<B_H*2>, Int<NUM_TILES*128>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
