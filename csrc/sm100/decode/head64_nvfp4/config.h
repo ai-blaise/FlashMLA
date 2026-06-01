@@ -52,6 +52,8 @@ static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
 
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 64;
+static constexpr int NVFP4_DUAL_QK_PACKED_BYTES = B_H * NVFP4_SCORE_BYTES * 2;
+static constexpr int NVFP4_DUAL_QK_SCALE_BYTES = B_TOPK * NUM_SCALES_EACH_TOKEN * 2;
 static constexpr int NUM_BUFS = 2;
 static constexpr int NUM_INDEX_BUFS = 3;  // NVFP4: reduced from 4 to fit SMEM (32 scales/token expands SMEM)
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
@@ -172,13 +174,23 @@ struct SharedMemoryPlan {
             union {
                 array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
                 array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
+                struct {
+                    array_aligned<uint8_t, NVFP4_DUAL_QK_PACKED_BYTES> q;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_DUAL_QK_SCALE_BYTES];
+                } native_qk;
             } o;
         } qo;
         struct {
-            struct {
-                array_aligned<bf16, B_H*D_NOPE> nope; // NoPE part, dequantized
-                array_aligned<bf16, B_H*D_ROPE> rope; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
-            } dequant[NUM_BUFS];
+            union {
+                struct {
+                    array_aligned<bf16, B_H*D_NOPE> nope; // NoPE part, dequantized
+                    array_aligned<bf16, B_H*D_ROPE> rope; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
+                } dequant[NUM_BUFS];
+                struct {
+                    array_aligned<uint8_t, NVFP4_DUAL_QK_PACKED_BYTES> k;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_DUAL_QK_SCALE_BYTES];
+                } native_qk[NUM_BUFS];
+            };
             static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not covers raw_nope
             // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope
             array_aligned<uint8_t, B_H*NVFP4_SCORE_BYTES> raw_nope[NUM_BUFS];  // Raw FP4-packed score dims
