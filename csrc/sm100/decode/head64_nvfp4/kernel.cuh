@@ -754,8 +754,10 @@ KernelTemplate<MODEL_TYPE>
 
         run_main_loop([&](const MainLoopArgs &args) {
             // plan.bar_last_store_done.wait(args.bar_phase_batch_rel); // No need to wait since the raw nope producer must wait
-            plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
-
+            // bar_q_utccp wait is deferred into the block loop so the scale precompute (which only depends on
+            // plan.scales, not Q) can overlap with the Q TMA + UTCCP latency for block 0. The wait is
+            // idempotent across iterations: only block 0 actually blocks; later blocks see the barrier
+            // already arrived and pass through instantly.
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                 plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
@@ -800,6 +802,9 @@ KernelTemplate<MODEL_TYPE>
                                 : "=r"(scale_bits) : "h"(packed_in));
                             scale_x2_arr[c] = *reinterpret_cast<__nv_bfloat162*>(&scale_bits);
                         }
+                        // Wait Q to be fully in TMEM before overwriting the aliased Q SMEM.
+                        // Subsequent block iterations see the barrier already arrived (no cost).
+                        plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
                         uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
                         CUTE_UNROLL
                         for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
@@ -843,6 +848,8 @@ KernelTemplate<MODEL_TYPE>
                         for (int s = 0; s < NUM_SCALES_EACH_TOKEN; ++s) {
                             scales_bf16[s] = __float2bfloat16_rn(float(plan.scales[rs.index_buf_idx][row_idx][s]));
                         }
+                        // Wait Q to be fully in TMEM before overwriting the aliased Q SMEM (idempotent).
+                        plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
                         uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
                         CUTE_UNROLL
                         for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
