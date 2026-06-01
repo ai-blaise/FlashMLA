@@ -684,12 +684,17 @@ KernelTemplate<MODEL_TYPE>
                             auto thr_tCtSFB_s2t_loop = thr_copy_s2t_SFB_loop.partition_D(tCtSFB_compact_loop);
                             copy(tiled_copy_s2t_SFB_loop, thr_tCsSFB_s2t_loop, thr_tCtSFB_s2t_loop);
 
+                            // Phase 4 cont v10: ensure UTCCP TMEM writes are visible to MMA
+                            ku::tcgen05_after_thread_sync();
+
                             auto sQ_fp4_frag_loop = tiled_mma_S_loop.get_slice(_0{}).partition_fragment_A(sQ_fp4_loop);
                             auto sK_fp4_frag_loop = tiled_mma_S_loop.get_slice(_0{}).partition_fragment_B(sK_fp4_loop);
-                            tiled_mma_S_loop.accumulate_ = UMMA::ScaleOut::One;
+                            // Phase 4 cont v11: start with Zero accumulator (fresh) to test if
+                            // hang is caused by dependency on RoPE MMA's tP. Will OVERWRITE RoPE.
+                            tiled_mma_S_loop.accumulate_ = UMMA::ScaleOut::Zero;
                             CUTE_UNROLL
                             for (int k = 0; k < size<2>(sQ_fp4_frag_loop); ++k) {
-                                // Phase 4 cont v8: re-enabled cute::gemm (K SMEM now SW128 again).
+                                // Phase 4 cont v10: gemm with UTCCP->TMEM sync barrier above.
                                 cute::gemm(
                                     tiled_mma_S_loop.with(tiled_mma_S_loop.accumulate_,
                                                           tCtSFA_loop(_, _, k),
@@ -697,6 +702,7 @@ KernelTemplate<MODEL_TYPE>
                                     sQ_fp4_frag_loop(_, _, k),
                                     sK_fp4_frag_loop(_, _, k),
                                     tP);
+                                tiled_mma_S_loop.accumulate_ = UMMA::ScaleOut::One;
                             }
                         }
                     } else {
