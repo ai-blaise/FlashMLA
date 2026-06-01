@@ -963,10 +963,17 @@ KernelTemplate<MODEL_TYPE>
                     ue4m3 scale_e4m3 = SFConv::convert(scale_f32);
                     uint8_t scale_byte = *reinterpret_cast<uint8_t*>(&scale_e4m3);
 
-                    // FLAT writes (Phase 5 for swizzle, Phase 4 cont'd for SF canonical)
+                    // Phase 4 cont v3: Q FP4 written LINEAR (consumer uses Layout_K_INTER_Atom now).
+                    // Q scales written via cute::Layout flat indexing (mirrors Phase 4 cont v2 for SFB).
+                    // For SFA: flat_idx = row*NUM_SCALES_EACH_TOKEN + col_block (= same ordering as SFB).
                     uint64_t* q_fp4_dst = (uint64_t*)(plan.u.qo.o.fp4.q_fp4.data() + row * (D_NOPE/2) + col_block * 8);
                     *q_fp4_dst = *(uint64_t*)fp4_bytes;
-                    *reinterpret_cast<uint8_t*>(&plan.u.qo.o.fp4.q_scales[row][col_block]) = scale_byte;
+                    {
+                        auto sfa_layout = SmemLayoutAtomSFA_QK{};
+                        int flat_idx = row * NUM_SCALES_EACH_TOKEN + col_block;
+                        int byte_off = sfa_layout(flat_idx);
+                        reinterpret_cast<uint8_t*>(&plan.u.qo.o.fp4.q_scales[0][0])[byte_off] = scale_byte;
+                    }
                 }
                 __syncwarp();
             }
