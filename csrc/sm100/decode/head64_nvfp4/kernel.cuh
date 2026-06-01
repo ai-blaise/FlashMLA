@@ -669,7 +669,7 @@ KernelTemplate<MODEL_TYPE>
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].wait(rs.index_bar_phase^1);
 
                     int tma_coords[2];
-                    alignas(16) e4m3 scales[2*NUM_SCALES_EACH_TOKEN];
+                    uint8_t* dst_scales = reinterpret_cast<uint8_t*>(plan.scales[rs.index_buf_idx] + lane_idx*2);
                     char valid_mask = 0;
                     CUTE_UNROLL
                     for (int i = 0; i < 2; ++i) {
@@ -686,21 +686,34 @@ KernelTemplate<MODEL_TYPE>
                         } else {
                             offset = block_idx*cur_k_block_stride + idx_in_block*NUM_SCALES_EACH_TOKEN;
                         }
-                        uint8_t* scale_bytes = reinterpret_cast<uint8_t*>(scales + i*NUM_SCALES_EACH_TOKEN);
-                        CUTE_UNROLL
-                        for (int s = 0; s < NUM_SCALES_EACH_TOKEN; ++s) {
-                            scale_bytes[s] = is_token_valid ? __ldg(cur_k_scales_ptr + offset + s) : 0;
+                        uint8_t* scale_bytes = dst_scales + i*NUM_SCALES_EACH_TOKEN;
+                        uint32_t* dst_words = reinterpret_cast<uint32_t*>(scale_bytes);
+                        if (is_token_valid) {
+                            const uint8_t* src = cur_k_scales_ptr + offset;
+                            const uint4* src_vec = reinterpret_cast<const uint4*>(src);
+                            uint4 v0 = __ldg(src_vec + 0);
+                            uint4 v1 = __ldg(src_vec + 1);
+                            dst_words[0] = v0.x;
+                            dst_words[1] = v0.y;
+                            dst_words[2] = v0.z;
+                            dst_words[3] = v0.w;
+                            dst_words[4] = v1.x;
+                            dst_words[5] = v1.y;
+                            dst_words[6] = v1.z;
+                            dst_words[7] = v1.w;
+                            if constexpr (NUM_SCALES_EACH_TOKEN > 32) {
+                                dst_words[8] = __ldg(reinterpret_cast<const uint32_t*>(src + 32));
+                            }
+                        } else {
+                            CUTE_UNROLL
+                            for (int s = 0; s < NUM_SCALES_EACH_TOKEN / 4; ++s) {
+                                dst_words[s] = 0;
+                            }
                         }
                     }
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                    uint8_t* dst_scales = reinterpret_cast<uint8_t*>(plan.scales[rs.index_buf_idx] + lane_idx*2);
-                    uint8_t* src_scales = reinterpret_cast<uint8_t*>(scales);
-                    CUTE_UNROLL
-                    for (int s = 0; s < 2*NUM_SCALES_EACH_TOKEN; ++s) {
-                        dst_scales[s] = src_scales[s];
-                    }
                     *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
                     if (lane_idx%4 == 0)
                         plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;

@@ -55,18 +55,20 @@ Command:
 python3 tests/nvfp4/bench_nvfp4_vs_fp8.py \
   --batch-sizes 1,8,32,64 \
   --topk 1024 \
-  --warmup 10 \
-  --iters 100
+  --warmup 20 \
+  --iters 120
 ```
 
 | Batch | Full-NVFP4 min us | FP8 min us | Full-NVFP4 vs FP8 |
 | ---: | ---: | ---: | ---: |
-| 1 | 59.5709 | 59.5363 | 0.9994x |
-| 8 | 67.7034 | 65.0851 | 0.9613x |
-| 32 | 90.1830 | 82.0845 | 0.9102x |
-| 64 | 121.3690 | 104.7392 | 0.8630x |
+| 1 | 59.5200 | 59.5197 | 1.0000x |
+| 8 | 65.3957 | 65.1928 | 0.9969x |
+| 32 | 82.6054 | 81.9123 | 0.9916x |
+| 64 | 104.8224 | 104.7213 | 0.9990x |
 
-The bridge reduces cache bytes from 656 bytes/token in the FP8 V3.2 layout to 336 bytes/token, but the BF16 dequant bridge dominates at useful batch sizes. The next required optimization is native NVFP4 tensor-core QK using the validated CuTe/CZS scaffold layout rather than additional BF16 bridge polishing.
+IKP SASS metrics showed the original bridge was dominated by scalar byte scale gathering in `csrc/sm100/decode/head64_nvfp4/kernel.cuh`. The current bridge therefore vector-loads the 36 inline E4M3 scale bytes and writes them directly into the shared scale buffer. That removes the local temporary copy and brings the BF16 bridge close to FP8 while preserving the 336-byte full-NVFP4 cache layout.
+
+The bridge reduces cache bytes from 656 bytes/token in the FP8 V3.2 layout to 336 bytes/token. The remaining gap is now small but still exists at batch 8 and 32, so the next required optimization remains native NVFP4 tensor-core QK using the validated CuTe/CZS scaffold layout rather than more BF16 bridge polishing.
 
 
 ### Native QK Cache-Row Scaffold
@@ -88,5 +90,7 @@ Observed on B200 after recheck: exact QK score tile, exact 512-dim value contrac
 | --- | --- |
 | Adjacent-lane scale sharing with `shfl` | Correct but slower at every measured batch |
 | `GROUP_SIZE=4` dequant ownership | Failed all-ones correctness with output mean about `0.5` |
+| 48-byte padded shared scale rows with three index buffers | Built, but failed launch because dynamic shared memory exceeded the practical B200 limit |
+| 48-byte padded shared scale rows with two index buffers | Correct but slower: batch 32 `83.00 us` and batch 64 `106.16 us` median |
 
 These candidates should not be retried unless the surrounding dequant layout changes substantially.
