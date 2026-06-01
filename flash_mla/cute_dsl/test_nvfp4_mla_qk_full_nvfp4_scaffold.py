@@ -148,9 +148,11 @@ class MlaQkValidator:
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         problem_size: tuple,
+        b_row_stride_fp4: int,
         stream: cuda.CUstream,
     ):
         m, n, k, l = problem_size
+        b_row_stride = cute.assume(b_row_stride_fp4, 32)
         self.mma_tiler = (MMA_TILER_MN[0], MMA_TILER_MN[1], MMA_TILER_K)
         self.cta_tile_shape_mnk = self.mma_tiler
 
@@ -165,7 +167,7 @@ class MlaQkValidator:
             b_ptr,
             cute.make_layout(
                 (n, cute.assume(k, 32), l),
-                stride=(cute.assume(k, 32), 1, cute.assume(n * k, 32)),
+                stride=(b_row_stride, 1, cute.assume(n * b_row_stride_fp4, 32)),
             ),
         )
         c_tensor = cute.make_tensor(
@@ -552,7 +554,7 @@ def nvfp4_quantize(t_bf16: torch.Tensor, sf_vec: int = 16):
     return q_fp4_val.view(*batch, K).contiguous(), sf_e4m3.contiguous()
 
 
-def run_test(bench=False, topk=128):
+def run_test(bench=False, topk=128, cache_layout=False):
     device = torch.device("cuda")
     m, n, k = B_H, topk, D_QK_LATENT
     # Round up problem to MMA tile multiples for the validator (smallest legal tile)
@@ -613,13 +615,27 @@ def run_test(bench=False, topk=128):
     K_packed = pack_fp4(K_fp4_dequant)
     print(f"Q_packed shape: {Q_packed.shape}, K_packed shape: {K_packed.shape}")
 
+    kv_cache = None
+    if cache_layout:
+        kv_cache = torch.zeros(n_pad, 336, dtype=torch.uint8, device=device)
+        kv_cache[:, :288] = K_packed
+        kv_cache[:, 288:324] = K_sf.to(torch.float8_e4m3fn).view(torch.uint8)
+        k_storage = kv_cache
+        b_row_stride_fp4 = 336 * 2
+        K_sf_source = kv_cache[:, 288:324].view(torch.float8_e4m3fn).float()
+        print("Using real 336-byte cache-row layout for K operand")
+    else:
+        k_storage = K_packed
+        b_row_stride_fp4 = k
+        K_sf_source = K_sf
+
     # FP4 tensors: view the (m_pad, k/2) uint8 as float4_e2m1fn_x2 so each
     # element is a packed pair. Then add the l dim and permute to (m, k//2, l)
     # matching the tutorial layout: contiguous on K, stride m*k//2 on L.
     l = 1
     # Tutorial pattern: torch.randint into (l, m, k//2) uint8 then permute(1, 2, 0)
     Q_packed_lmk = Q_packed.unsqueeze(0).contiguous()  # (1, m_pad, k/2)
-    K_packed_lnk = K_packed.unsqueeze(0).contiguous()
+    K_packed_lnk = k_storage.unsqueeze(0).contiguous()
     Q_f4 = Q_packed_lmk.view(torch.float4_e2m1fn_x2).permute(1, 2, 0)
     K_f4 = K_packed_lnk.view(torch.float4_e2m1fn_x2).permute(1, 2, 0)
 
@@ -628,7 +644,7 @@ def run_test(bench=False, topk=128):
     sf_k = ceil_div(k, SF_VEC)
     # Q_sf / K_sf have shape (m_pad, sf_k); cast to e4m3 on CPU and add l=1 dim.
     Q_sf_e4m3_ref_cpu = Q_sf.to(torch.float8_e4m3fn).cpu().unsqueeze(-1).contiguous()
-    K_sf_e4m3_ref_cpu = K_sf.to(torch.float8_e4m3fn).cpu().unsqueeze(-1).contiguous()
+    K_sf_e4m3_ref_cpu = K_sf_source.to(torch.float8_e4m3fn).cpu().unsqueeze(-1).contiguous()
     # Build the blocked SF tensors on CUDA via the cvt helper.
     Q_sf_blocked = create_cute_scale_factor_tensor(l, m_pad, sf_k, Q_sf_e4m3_ref_cpu)
     K_sf_blocked = create_cute_scale_factor_tensor(l, n_pad, sf_k, K_sf_e4m3_ref_cpu)
@@ -665,13 +681,14 @@ def run_test(bench=False, topk=128):
         runner,
         a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr,
         (m_pad, n_pad, k, l),
+        b_row_stride_fp4,
         current_stream,
     )
 
     print("Launching...")
     compiled(
         a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr,
-        (m_pad, n_pad, k, l), current_stream,
+        (m_pad, n_pad, k, l), b_row_stride_fp4, current_stream,
     )
     torch.cuda.synchronize()
 
@@ -729,7 +746,8 @@ def run_test(bench=False, topk=128):
                 assumed_align=32,
             )
             args = cute.testing.JitArguments(
-                a_p, b_p, sfa_p, sfb_p, c_p, (m_pad, n_pad, k, l), current_stream
+                a_p, b_p, sfa_p, sfb_p, c_p,
+                (m_pad, n_pad, k, l), b_row_stride_fp4, current_stream,
             )
             args.add_to_scope([Q_f4, K_f4, Q_sf_blocked, K_sf_blocked, C])
             return args
@@ -764,5 +782,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--topk", type=int, default=128)
+    parser.add_argument("--cache-layout", action="store_true")
     args = parser.parse_args()
-    run_test(bench=args.bench, topk=args.topk)
+    run_test(bench=args.bench, topk=args.topk, cache_layout=args.cache_layout)

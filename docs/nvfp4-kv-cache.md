@@ -68,6 +68,20 @@ python3 tests/nvfp4/bench_nvfp4_vs_fp8.py \
 
 The bridge reduces cache bytes from 656 bytes/token in the FP8 V3.2 layout to 336 bytes/token, but the BF16 dequant bridge dominates at useful batch sizes. The next required optimization is native NVFP4 tensor-core QK using the validated CuTe/CZS scaffold layout rather than additional BF16 bridge polishing.
 
+
+### Native QK Cache-Row Scaffold
+
+After the bridge checkpoint, the CuTe full-NVFP4 QK scaffold was tightened to support `--cache-layout`. In that mode the K operand is read from the real 336-byte KV cache row layout, with a 672-FP4-element row stride that skips the inline scales and padding rather than repacking K into a dense matrix.
+
+```bash
+python3 flash_mla/cute_dsl/test_nvfp4_mla_qk_full_nvfp4_scaffold.py \
+  --topk 1024 \
+  --cache-layout \
+  --bench
+```
+
+Observed on B200 after recheck: exact QK score tile, exact 512-dim value contract, and `39.13 us` for `M=128`, `N=1024`, `K=576`. This is slower than the same-run dense packed scaffold (`31.35 us`) but is the correct native-QK baseline because it exercises the production KV row stride.
+
 ## Rejected Candidates
 
 | Candidate | Result |
