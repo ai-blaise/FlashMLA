@@ -645,12 +645,11 @@ KernelTemplate<MODEL_TYPE>
                         ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
 
                         // QK NoPE (FP4) — Phase 1 of C++ FP4 MMA path.
-                        // Phase 4 cont v6: DEBUG — wrap in if constexpr (false) to isolate FP4 MMA.
-                        // If hang persists, cause is elsewhere. If hang resolves, FP4 MMA is the issue.
+                        // Phase 4 cont v7: re-enable structure but skip gemm() to isolate hang to gemm.
                         plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
                         plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
                         ku::tcgen05_after_thread_sync();
-                        if constexpr (false) {
+                        if constexpr (true) {
                             TiledMMA tiled_mma_S_loop = TiledMMA_S_NVFP4{};
                             Tensor sQ_fp4_loop = make_tensor(
                                 make_smem_ptr(reinterpret_cast<e2m1*>(plan.u.qo.o.fp4.q_fp4.data())),
@@ -690,7 +689,8 @@ KernelTemplate<MODEL_TYPE>
                             tiled_mma_S_loop.accumulate_ = UMMA::ScaleOut::One;
                             CUTE_UNROLL
                             for (int k = 0; k < size<2>(sQ_fp4_frag_loop); ++k) {
-                                cute::gemm(
+                                // Phase 4 cont v7 DEBUG: skip cute::gemm to isolate hang
+                                if constexpr (false) cute::gemm(
                                     tiled_mma_S_loop.with(tiled_mma_S_loop.accumulate_,
                                                           tCtSFA_loop(_, _, k),
                                                           tCtSFB_loop(_, _, k)),
