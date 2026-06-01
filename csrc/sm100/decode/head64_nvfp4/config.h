@@ -104,15 +104,15 @@ using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
 
 using SmemLayoutQ_SW128 = SmemLayoutQTiles<D_Q_SW128/64>;
 
-// FP4-packed Q SMEM layout for the MXF4 atom (commit 3+4: SW128-swizzle Q + K).
-// e2m1 = 4 bits, so this stores D_NOPE FP4 elems = D_NOPE/2 bytes per head row.
-// SW128 atom with e2m1 specializes via cute::upcast<sizeof_bits<e2m1>::value>.
-// SW128 swizzle is required to satisfy SM100_MMA_MXF4_SS smem-descriptor canonical
-// UMMA_K stride check. SW64/INTER variants fail "Not a canonical UMMA_K Layout".
+// FP4-packed Q SMEM layout for the MXF4 atom.
+// Phase 5 Option B consistency: switched from Layout_K_SW128_Atom to Layout_K_INTER_Atom
+// to match K SMEM (also INTER atom). Q quant writes linear bytes — INTER atom reads linear.
+// (Earlier SW128 attempt failed canonical UMMA_K check at full K=512; with TileShape K=256
+//  the INTER atom passes the check and matches our linear Q quant writes from Phase 3b.)
 template<int NUM_TILES>
 using SmemLayoutQ_FP4_Tiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<e2m1>{},
-    Shape<Int<B_H>, Int<NUM_TILES*128>>{},   // 128 e2m1 elems per atom row = 64B SW128 atom
+    UMMA::Layout_K_INTER_Atom<e2m1>{},
+    Shape<Int<B_H>, Int<NUM_TILES*128>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 // Use V32 dim (512) so the layout is always well-defined.
