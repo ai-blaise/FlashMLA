@@ -60,6 +60,12 @@ static constexpr int NVFP4_NATIVE_K_PACKED_BYTES = B_TOPK * NVFP4_SCORE_BYTES;
 static constexpr int NVFP4_NATIVE_K_SCALE_BYTES = NVFP4_DUAL_QK_SCALE_BYTES;
 static constexpr int NUM_NATIVE_INDEX_BUFS = 2;
 static constexpr int NUM_BUFS = 2;
+// raw_nope is double-buffered with NUM_BUFS in the canonical Phase 2 layout, but the
+// raw KV producer (warp 5) and the dequant warp are decoupled from the V dequant ring,
+// so we can give raw_nope a deeper pipeline of NUM_RAW_BUFS=3 without growing kv (kv is
+// dequant[NUM_BUFS]=144K + raw_nope[NUM_RAW_BUFS]=54K = 198K, still smaller than qo=202K
+// in the union, so the union size and SMEM total stay at the same 227K as NUM_BUFS=2).
+static constexpr int NUM_RAW_BUFS = 3;
 static constexpr int NUM_INDEX_BUFS = 3;  // NVFP4: reduced from 4 to fit SMEM (32 scales/token expands SMEM)
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
 static constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
@@ -234,8 +240,10 @@ struct SharedMemoryPlan {
                 } native_qk[NUM_BUFS];
             };
             static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not covers raw_nope
-            // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope
-            array_aligned<uint8_t, B_H*NVFP4_SCORE_BYTES> raw_nope[NUM_BUFS];  // Raw FP4-packed score dims
+            // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope.
+            // Deeper pipelined than dequant: NUM_RAW_BUFS=3 lets the raw KV TMA producer
+            // run two blocks ahead of the WG2 dequant warp.
+            array_aligned<uint8_t, B_H*NVFP4_SCORE_BYTES> raw_nope[NUM_RAW_BUFS];  // Raw FP4-packed score dims
         } kv;
     } u;
     union {
@@ -251,7 +259,7 @@ struct SharedMemoryPlan {
     transac_bar_t bar_q_tma, bar_q_utccp;
     transac_bar_t bar_rope_ready[NUM_BUFS];
     transac_bar_t bar_nope_ready[NUM_BUFS];
-    transac_bar_t bar_raw_ready[NUM_BUFS], bar_raw_free[NUM_BUFS];
+    transac_bar_t bar_raw_ready[NUM_RAW_BUFS], bar_raw_free[NUM_RAW_BUFS];
     transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS], bar_valid_coord_scale_free[NUM_INDEX_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
 };

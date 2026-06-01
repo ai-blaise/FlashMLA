@@ -50,11 +50,13 @@ KernelTemplate<MODEL_TYPE>
             for (int i = 0; i < NUM_BUFS; ++i) {
                 plan.bar_rope_ready[i].init(MODEL_TYPE == ModelType::V32 ? 128 : 1);
                 plan.bar_nope_ready[i].init(128);
-                plan.bar_raw_ready[i].init(1);
-                plan.bar_raw_free[i].init(128);
                 plan.bar_qk_done[i].init(1);
                 plan.bar_so_ready[i].init(128);
                 plan.bar_sv_done[i].init(1);
+            }
+            for (int i = 0; i < NUM_RAW_BUFS; ++i) {
+                plan.bar_raw_ready[i].init(1);
+                plan.bar_raw_free[i].init(128);
             }
             for (int i = 0; i < NUM_INDEX_BUFS; ++i) {
                 plan.bar_valid_coord_scale_ready[i].init(32);
@@ -122,11 +124,15 @@ KernelTemplate<MODEL_TYPE>
     struct RingState {
         int buf_idx = 0;
         bool bar_phase = 0;
+        int raw_buf_idx = 0;
+        bool raw_bar_phase = 0;
         int index_buf_idx = 0;
         bool index_bar_phase = 0;
         CUTE_DEVICE void update() {
             bar_phase ^= (buf_idx == NUM_BUFS-1);
             buf_idx = (buf_idx+1) % NUM_BUFS;
+            raw_bar_phase ^= (raw_buf_idx == NUM_RAW_BUFS-1);
+            raw_buf_idx = (raw_buf_idx+1) % NUM_RAW_BUFS;
             index_bar_phase ^= (index_buf_idx == NUM_INDEX_BUFS-1);
             index_buf_idx = (index_buf_idx+1) % NUM_INDEX_BUFS;
         }
@@ -593,7 +599,9 @@ KernelTemplate<MODEL_TYPE>
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
-                    plan.bar_raw_free[rs.buf_idx].wait(rs.bar_phase^1);
+                    // raw_nope is on its own NUM_RAW_BUFS=3 ring, decoupled from the dequant
+                    // output ring (NUM_BUFS=2). This lets warp 5 prefetch one extra block ahead.
+                    plan.bar_raw_free[rs.raw_buf_idx].wait(rs.raw_bar_phase^1);
                     int4 cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + 0);
                     int4 nxt_cur_indices;
                     CUTE_UNROLL
@@ -602,15 +610,15 @@ KernelTemplate<MODEL_TYPE>
                             nxt_cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + row + 4);
                         ku::tma_gather4(
                             block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_nope : &tma_params.tensor_map_kv_nope,
-                            plan.bar_raw_ready[rs.buf_idx],
-                            plan.u.kv.raw_nope[rs.buf_idx].data() + NVFP4_SCORE_BYTES*row,  // NVFP4 packed score
+                            plan.bar_raw_ready[rs.raw_buf_idx],
+                            plan.u.kv.raw_nope[rs.raw_buf_idx].data() + NVFP4_SCORE_BYTES*row,  // NVFP4 packed score
                             0,
                             cur_indices,
                             (int64_t)TMA::CacheHintSm90::EVICT_LAST
                         );
                         cur_indices = nxt_cur_indices;
                     }
-                    plan.bar_raw_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*NVFP4_SCORE_BYTES*sizeof(uint8_t));
+                    plan.bar_raw_ready[rs.raw_buf_idx].arrive_and_expect_tx(B_TOPK*NVFP4_SCORE_BYTES*sizeof(uint8_t));
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                     rs.update();
                 }
@@ -749,8 +757,11 @@ KernelTemplate<MODEL_TYPE>
         bf16* nope1_base = nope0_base + (plan.u.kv.dequant[1].nope.data() - plan.u.kv.dequant[0].nope.data());
         bf16* rope0_base = &rope0(group_idx, idx_in_group*8);
         bf16* rope1_base = rope0_base + (plan.u.kv.dequant[1].rope.data() - plan.u.kv.dequant[0].rope.data());
-        uint8_t* raw_nope0_base = plan.u.kv.raw_nope[rs.buf_idx].data() + group_idx*NVFP4_SCORE_BYTES + idx_in_group*4;
-        uint8_t* raw_nope1_base = raw_nope0_base + B_H*NVFP4_SCORE_BYTES;
+        // raw_nope is on its own NUM_RAW_BUFS-deep ring. The bufs are contiguous in SMEM,
+        // so we materialize one base address and step by RAW_NOPE_STRIDE * raw_buf_idx in
+        // the hot path (single MAD instead of an array load).
+        uint8_t* raw_nope_base0 = plan.u.kv.raw_nope[0].data() + group_idx*NVFP4_SCORE_BYTES + idx_in_group*4;
+        constexpr int RAW_NOPE_STRIDE = B_H*NVFP4_SCORE_BYTES;
 
         run_main_loop([&](const MainLoopArgs &args) {
             // plan.bar_last_store_done.wait(args.bar_phase_batch_rel); // No need to wait since the raw nope producer must wait
@@ -761,11 +772,11 @@ KernelTemplate<MODEL_TYPE>
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                 plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
-                plan.bar_raw_ready[rs.buf_idx].wait(rs.bar_phase);
+                plan.bar_raw_ready[rs.raw_buf_idx].wait(rs.raw_bar_phase);
                 plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
                 uint32_t cur_nope_base_uint_addr = cute::cast_smem_ptr_to_uint(rs.buf_idx == 0 ? nope0_base : nope1_base);
                 uint32_t cur_rope_base_uint_addr = cute::cast_smem_ptr_to_uint(rs.buf_idx == 0 ? rope0_base : rope1_base);
-                uint8_t* raw_nope_base = rs.buf_idx == 0 ? raw_nope0_base : raw_nope1_base;
+                uint8_t* raw_nope_base = raw_nope_base0 + rs.raw_buf_idx * RAW_NOPE_STRIDE;
                 auto st_128b = [&](int local_row_idx, int local_col_idx, __int128_t &data) {
                     uint32_t base_addr = cur_nope_base_uint_addr;
                     int dst_col_idx = local_col_idx;
@@ -896,7 +907,7 @@ KernelTemplate<MODEL_TYPE>
                 // the inner loop completes, both are no longer needed. Arrive their `free` barriers
                 // before the fence so warp 5 and warp 7 can begin refilling the next ring slot in
                 // parallel with the BF16 K SMEM stores draining through the fence.
-                plan.bar_raw_free[rs.buf_idx].arrive();
+                plan.bar_raw_free[rs.raw_buf_idx].arrive();
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                 cutlass::arch::fence_view_async_shared();
                 plan.bar_nope_ready[rs.buf_idx].arrive();
