@@ -796,12 +796,14 @@ KernelTemplate<MODEL_TYPE>
                 };
                 // The following code suffers from a 2-way bank conflict when reading from SMEM.
                 if constexpr (MODEL_TYPE == ModelType::V32) {
+                    // Precompute scales for ALL rows FIRST. This 36-cvt batch overlaps with the
+                    // Q UTCCP latency on block 0 (the only block where bar_q_utccp actually blocks).
+                    // Hoisting also lets us call bar_q_utccp.wait once per block instead of once per row.
+                    __nv_bfloat162 scale_x2_arr_all[ROWS_PER_GROUP][COLS_PER_GROUP];
                     CUTE_UNROLL
                     for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
                         const e4m3* scales_src = plan.scales[rs.index_buf_idx][row_idx];
-                        // Precompute only the COLS_PER_GROUP scales this thread actually reads (skip-4 pattern).
-                        __nv_bfloat162 scale_x2_arr[COLS_PER_GROUP];
                         CUTE_UNROLL
                         for (int c = 0; c < COLS_PER_GROUP; ++c) {
                             int scale_idx = (c * (GROUP_SIZE * 8) + idx_in_group * 8) / 16;
@@ -811,11 +813,12 @@ KernelTemplate<MODEL_TYPE>
                             asm volatile(
                                 "cvt.rn.bf16x2.e4m3x2 %0, %1;"
                                 : "=r"(scale_bits) : "h"(packed_in));
-                            scale_x2_arr[c] = *reinterpret_cast<__nv_bfloat162*>(&scale_bits);
+                            scale_x2_arr_all[local_row_idx][c] = *reinterpret_cast<__nv_bfloat162*>(&scale_bits);
                         }
-                        // Wait Q to be fully in TMEM before overwriting the aliased Q SMEM.
-                        // Subsequent block iterations see the barrier already arrived (no cost).
-                        plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
+                    }
+                    plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
+                    CUTE_UNROLL
+                    for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         uint32_t cur_data_fp4 = get_raw_fp4(local_row_idx, 0);
                         CUTE_UNROLL
                         for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
@@ -838,7 +841,7 @@ KernelTemplate<MODEL_TYPE>
                                   "=r"(bf16x2_packed[2]),
                                   "=r"(bf16x2_packed[3])
                                 : "r"(cur_data_fp4));
-                            __nv_bfloat162 scale_x2 = scale_x2_arr[local_col_idx];
+                            __nv_bfloat162 scale_x2 = scale_x2_arr_all[local_row_idx][local_col_idx];
                             CUTE_UNROLL
                             for (int b = 0; b < 4; ++b) {
                                 __nv_bfloat162 bf16x2 = *reinterpret_cast<__nv_bfloat162*>(&bf16x2_packed[b]);
