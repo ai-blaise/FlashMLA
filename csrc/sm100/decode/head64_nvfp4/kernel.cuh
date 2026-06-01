@@ -892,10 +892,14 @@ KernelTemplate<MODEL_TYPE>
                         }
                     }
                 }
-                cutlass::arch::fence_view_async_shared();
-                plan.bar_nope_ready[rs.buf_idx].arrive();
+                // The raw_nope SMEM and the scales/indices SMEM are only READ inputs to dequant. After
+                // the inner loop completes, both are no longer needed. Arrive their `free` barriers
+                // before the fence so warp 5 and warp 7 can begin refilling the next ring slot in
+                // parallel with the BF16 K SMEM stores draining through the fence.
                 plan.bar_raw_free[rs.buf_idx].arrive();
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
+                cutlass::arch::fence_view_async_shared();
+                plan.bar_nope_ready[rs.buf_idx].arrive();
                 rs.update();
             }
         });
