@@ -994,7 +994,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
             k_ptr,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B
         );  // NOTE We combine 8 float8 into 1 int64 since boxdim cannot > 256
         CUtensorMap tensor_map_kv_rope{};
         if constexpr (MODEL_TYPE != ModelType::V32) {
