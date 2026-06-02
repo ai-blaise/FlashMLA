@@ -452,7 +452,7 @@ KernelTemplate<MODEL_TYPE>
                         gQ,
                         sQ,
                         plan.bar_q_tma,
-                        TMA::CacheHintSm90::EVICT_FIRST
+                        TMA::CacheHintSm90::EVICT_LAST
                     );
                 }
                 // Issue Q (SW64) G -> S
@@ -460,7 +460,7 @@ KernelTemplate<MODEL_TYPE>
                     cute::SM90_TMA_LOAD_5D::copy(
                         &tma_params.tensor_map_q_sw64,
                         (uint64_t*)&plan.bar_q_tma,
-                        (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
+                        (uint64_t)TMA::CacheHintSm90::EVICT_LAST,
                         plan.u.qo.q_sw64,
                         0, 0, 0,
                         s_q_idx, args.batch_idx
@@ -979,7 +979,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
             (bf16*)params.q + D_Q_SW128,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B
         );
     }
 
@@ -1005,7 +1005,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
                 (uint8_t*)k_ptr + (D_NOPE/2),
                 CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
                 K_ROPE_SW == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B
             );
         }
         return {tensor_map_kv_nope, tensor_map_kv_rope};
