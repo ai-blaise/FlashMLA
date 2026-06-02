@@ -75,13 +75,13 @@ def _make_fp8_cache(num_blocks):
 
 def time_case(batch_size, topk, warmup, iters):
     num_blocks, q, indices, topk_length, sm_scale = _make_common_inputs(batch_size, topk)
-    nvfp4_kv = make_random_full_nvfp4(num_blocks, PAGE_BLOCK_SIZE)
+    nvfp4_kv, nvfp4_scales = make_random_full_nvfp4(num_blocks, PAGE_BLOCK_SIZE)
     fp8_kv = _make_fp8_cache(num_blocks)
     kv_scales_unused = torch.zeros(num_blocks, PAGE_BLOCK_SIZE, 1, 32, dtype=torch.uint8, device=DEVICE)
 
     def run_nvfp4():
         fc.sparse_decode_fwd_nvfp4(
-            q, nvfp4_kv, kv_scales_unused, indices, topk_length,
+            q, nvfp4_kv, nvfp4_scales, indices, topk_length,
             None, None, None, D_V, sm_scale)
 
     def run_fp8():

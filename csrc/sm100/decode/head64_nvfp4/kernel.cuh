@@ -645,11 +645,11 @@ KernelTemplate<MODEL_TYPE>
             int tma_coords_step_per_extra_block = params.stride_extra_kv_block / TMA_K_STRIDE;
             uint8_t* k_scales_ptr =
                 MODEL_TYPE == ModelType::V32 ?
-                (uint8_t*)params.kv + NVFP4_SCORE_BYTES :
+                params.kv_scales :
                 (uint8_t*)params.kv + params.page_block_size*((D_NOPE/2)+2*D_ROPE);
             uint8_t* extra_k_scales_ptr =
                 MODEL_TYPE == ModelType::V32 ?
-                (uint8_t*)params.extra_kv + NVFP4_SCORE_BYTES :
+                nullptr :
                 (uint8_t*)params.extra_kv + params.extra_page_block_size*((D_NOPE/2)+2*D_ROPE);
 
             run_main_loop([&](const MainLoopArgs &args) {
@@ -663,6 +663,10 @@ KernelTemplate<MODEL_TYPE>
                     int cur_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
                     int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
                     [[maybe_unused]] int cur_k_row_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_row : params.stride_kv_row;
+                    int64_t cur_scale_block_stride =
+                        (MODEL_TYPE == ModelType::V32 && !IS_EXTRA_BLOCK) ? params.stride_kv_scales_block : cur_k_block_stride;
+                    int cur_scale_row_stride =
+                        (MODEL_TYPE == ModelType::V32 && !IS_EXTRA_BLOCK) ? params.stride_kv_scales_row : cur_k_row_stride;
                     uint8_t* cur_k_scales_ptr = IS_EXTRA_BLOCK ? extra_k_scales_ptr : k_scales_ptr;
                     int cur_tma_coords_step_per_block = IS_EXTRA_BLOCK ? tma_coords_step_per_extra_block : tma_coords_step_per_block;
 
@@ -690,7 +694,7 @@ KernelTemplate<MODEL_TYPE>
 
                         int64_t offset;
                         if constexpr (MODEL_TYPE == ModelType::V32) {
-                            offset = is_token_valid ? block_idx*cur_k_block_stride + idx_in_block*cur_k_row_stride : 0;
+                            offset = is_token_valid ? block_idx*cur_scale_block_stride + idx_in_block*cur_scale_row_stride : 0;
                         } else {
                             offset = block_idx*cur_k_block_stride + idx_in_block*NUM_SCALES_EACH_TOKEN;
                         }
@@ -698,19 +702,10 @@ KernelTemplate<MODEL_TYPE>
                         uint32_t* dst_words = reinterpret_cast<uint32_t*>(scale_bytes);
                         if (is_token_valid) {
                             const uint8_t* src = cur_k_scales_ptr + offset;
-                            const uint4* src_vec = reinterpret_cast<const uint4*>(src);
-                            uint4 v0 = __ldg(src_vec + 0);
-                            uint4 v1 = __ldg(src_vec + 1);
-                            dst_words[0] = v0.x;
-                            dst_words[1] = v0.y;
-                            dst_words[2] = v0.z;
-                            dst_words[3] = v0.w;
-                            dst_words[4] = v1.x;
-                            dst_words[5] = v1.y;
-                            dst_words[6] = v1.z;
-                            dst_words[7] = v1.w;
-                            if constexpr (NUM_SCALES_EACH_TOKEN > 32) {
-                                dst_words[8] = __ldg(reinterpret_cast<const uint32_t*>(src + 32));
+                            const uint32_t* src_words = reinterpret_cast<const uint32_t*>(src);
+                            CUTE_UNROLL
+                            for (int s = 0; s < NUM_SCALES_EACH_TOKEN / 4; ++s) {
+                                dst_words[s] = __ldg(src_words + s);
                             }
                         } else {
                             CUTE_UNROLL
@@ -947,9 +942,11 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.d_qk == D_Q);
     KU_ASSERT(params.d_v == D_V);
-    if constexpr (MODEL_TYPE == ModelType::MODEL1) {
-        constexpr int BYTES_PER_TOKEN = NVFP4_TOKEN_BYTES;
-        KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
+    constexpr int BYTES_PER_TOKEN = NVFP4_TOKEN_BYTES;
+    KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in NVFP4 KV cache must be contiguous for head64 sparse decoding attention");
+    if constexpr (MODEL_TYPE == ModelType::V32) {
+        KU_ASSERT(params.kv_scales != nullptr, "V3.2 NVFP4 decode requires separate KV scale pool");
+        KU_ASSERT(params.stride_kv_scales_row == NUM_SCALES_EACH_TOKEN, "V3.2 NVFP4 scales must be contiguous per token");
     }
 
     auto shape_Q_SW128 = make_shape(B_H, D_Q, params.s_q, params.b);

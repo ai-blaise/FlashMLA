@@ -109,7 +109,7 @@ protected:
 
 
 // NVFP4 KV variant of Head64x2 — calls head64_nvfp4 kernel twice for h_q=128
-// V32 layout per token: 288 FP4 score bytes + 36 E4M3 scales + 12 B padding = 336 B.
+// V32 layout per token: 288 FP4 score bytes in kv plus 36 E4M3 scale bytes in kv_scales.
 class Decode_Sm100_Head64x2_NVFP4_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_128,
@@ -538,17 +538,17 @@ sparse_attn_decode_interface(
 // ============================================================
 //
 // Decode path for NVFP4 sparse-MLA. The V3.2 path stores every QK score
-// dimension, including RoPE, as packed e2m1 with inline E4M3 block scales.
-// The current production bridge dequants to BF16 in SMEM before entering the
-// existing BF16 UMMA pipeline.
+// dimension, including RoPE, as packed e2m1 in the KV data pool and reads
+// E4M3 block scales from a separate scale pool. The current production bridge
+// dequants to BF16 in SMEM before entering the existing BF16 UMMA pipeline.
 
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128_nvfp4/phase1.h"
 
 // V3.2 full-NVFP4 layout:
-//   - kv: [num_pages, page_size, h_kv=1, 336] uint8
-//       Per token: 288 bytes FP4-packed score dims + 36 bytes E4M3 scales
-//       + 12 bytes padding.
-//   - kv_scales is unused for V3.2 and kept only for API compatibility.
+//   - kv:        [num_pages, page_size, h_kv=1, 288] uint8
+//       Per token: 288 bytes FP4-packed score dims.
+//   - kv_scales: [num_pages, page_size, h_kv=1, 36]  uint8
+//       Per token: 36 E4M3 block scales.
 // MODEL1 keeps the legacy split layout:
 //   - kv:        [num_pages, page_size, h_kv=1, 352] uint8
 //   - kv_scales: [num_pages, page_size, h_kv=1, 32]  uint8
@@ -559,8 +559,8 @@ sparse_attn_decode_interface(
 std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_nvfp4_interface(
     const at::Tensor &q,         // [b, s_q, h_q, d_qk] bf16
-    const at::Tensor &kv,        // V3.2: [num_pages, page_size, h_kv=1, 336] uint8
-    const at::Tensor &kv_scales, // MODEL1 only: [num_pages, page_size, h_kv=1, 32] uint8
+    const at::Tensor &kv,        // V3.2: [num_pages, page_size, h_kv=1, 288] uint8
+    const at::Tensor &kv_scales, // V3.2: [num_pages, page_size, h_kv=1, 36] uint8
     const at::Tensor &indices,   // [b, s_q, topk] int32
     const std::optional<at::Tensor> &topk_length,
     const std::optional<at::Tensor> &attn_sink,

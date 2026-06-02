@@ -41,11 +41,13 @@ static constexpr int D_ROPE = 64;
 static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 16 : 16;  // NVFP4 block size
 static constexpr bool V_HAVE_ROPE = MODEL_TYPE == ModelType::V32 ? false : true;
 static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 36 : 32;
-// V32 full-NVFP4 token layout: 576 packed FP4 score dims (288 B),
-// 36 E4M3 scales (one per 16 dims), then 12 B padding for 16 B alignment.
-// PV consumes only the first D_V=512 dequantized dims.
+// V32 full-NVFP4 score cache layout for op-trt: 576 packed FP4 score dims
+// (288 B/token) in the KV data pool. E4M3 block scales are stored in the
+// separate KV scale pool at 36 B/token, matching TensorRT-LLM NVFP4 cache
+// storage and avoiding request-time repacking. PV consumes the first D_V=512
+// dequantized dims.
 static constexpr int NVFP4_SCORE_BYTES = MODEL_TYPE == ModelType::V32 ? D_Q / 2 : D_NOPE / 2;
-static constexpr int NVFP4_TOKEN_BYTES = MODEL_TYPE == ModelType::V32 ? 336 : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;
+static constexpr int NVFP4_TOKEN_BYTES = MODEL_TYPE == ModelType::V32 ? NVFP4_SCORE_BYTES : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;
 static constexpr int TMA_K_STRIDE = NVFP4_TOKEN_BYTES;
 static_assert(D_NOPE + D_ROPE == D_Q);
 static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));

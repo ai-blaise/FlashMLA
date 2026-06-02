@@ -16,7 +16,7 @@ num_blocks = 4
 sm_scale = 1.0 / (D_QK ** 0.5)
 
 q = torch.randn(b, s_q, h_q, D_QK, dtype=torch.bfloat16, device=DEVICE) * 0.05
-kv = make_random_full_nvfp4(num_blocks, page_block_size)
+kv, kv_scales = make_random_full_nvfp4(num_blocks, page_block_size)
 indices = torch.randperm(num_blocks * page_block_size, device=DEVICE)[:topk]
 indices = indices.int().expand(b, s_q, topk).contiguous()
 topk_length = torch.full((b,), topk, dtype=torch.int32, device=DEVICE)
@@ -24,8 +24,8 @@ topk_length = torch.full((b,), topk, dtype=torch.int32, device=DEVICE)
 print("Phase 2 reference test: kernel vs Python full-NVFP4 reference")
 print(f"  q={tuple(q.shape)} kv={tuple(kv.shape)} indices={tuple(indices.shape)}")
 
-out_kernel, _ = run_kernel(q, kv, indices, topk_length, sm_scale)
-out_ref = reference_attention(q, kv, indices, sm_scale)
+out_kernel, _ = run_kernel(q, kv, kv_scales, indices, topk_length, sm_scale)
+out_ref = reference_attention(q, kv, kv_scales, indices, sm_scale)
 kernel = out_kernel.float()
 ref = out_ref.float()
 passed, abs_diff, rms, cos = assert_reference_close(kernel, ref)

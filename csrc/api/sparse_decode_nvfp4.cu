@@ -63,10 +63,11 @@ sparse_attn_decode_nvfp4_interface(
     int h_kv = kv.size(2);
     int topk = indices.size(2);
 
-    // For d_qk=576 (V3.2): full-NVFP4 score KV = 288 FP4 bytes + 36 scales + 12 padding = 336 B.
-    // For d_qk=512 (MODEL1): legacy packed KV remains 352 B; kv_scales is separate.
-    const int NVFP4_NOPE_ROPE_BYTES = (d_qk == 576) ? 336 : 352;
-    const int NVFP4_SCALES_BYTES = 32;  // MODEL1 separate scale buffer size
+    // For d_qk=576 (V3.2): op-trt stores 288 FP4 score bytes in the data pool
+    // and 36 E4M3 scale bytes in a separate scale pool. For d_qk=512 (MODEL1),
+    // legacy packed KV remains 352 B with a separate 32-byte scale pool.
+    const int NVFP4_NOPE_ROPE_BYTES = (d_qk == 576) ? 288 : 352;
+    const int NVFP4_SCALES_BYTES = (d_qk == 576) ? 36 : 32;
 
     bool have_topk_length = topk_length.has_value();
     bool have_attn_sink = attn_sink.has_value();
@@ -101,14 +102,9 @@ sparse_attn_decode_nvfp4_interface(
 
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, NVFP4_NOPE_ROPE_BYTES);
-    if (d_qk == 512) {
-        KU_CHECK_SHAPE(kv_scales, num_blocks, page_block_size, h_kv, NVFP4_SCALES_BYTES);
-    }
-    // For d_qk=576, scales are inline in the kv buffer; kv_scales tensor is unused.
+    KU_CHECK_SHAPE(kv_scales, num_blocks, page_block_size, h_kv, NVFP4_SCALES_BYTES);
     TORCH_CHECK(kv.stride(1) == NVFP4_NOPE_ROPE_BYTES, "kv tokens must be contiguous; stride(1)=", kv.stride(1));
-    if (d_qk == 512) {
-        TORCH_CHECK(kv_scales.stride(1) == NVFP4_SCALES_BYTES, "kv_scales tokens must be contiguous; stride(1)=", kv_scales.stride(1));
-    }
+    TORCH_CHECK(kv_scales.stride(1) == NVFP4_SCALES_BYTES, "kv_scales tokens must be contiguous; stride(1)=", kv_scales.stride(1));
     KU_CHECK_SHAPE(indices, b, s_q, topk);
     KU_CHECK_SHAPE(topk_length, b);
     KU_CHECK_SHAPE(attn_sink, h_q);
@@ -151,10 +147,10 @@ sparse_attn_decode_nvfp4_interface(
         0, 0, 0,
         nullptr, nullptr, nullptr,
 
-        // NVFP4: kv_scales buffer (only used by head128 MODEL1 path; head64 V32 path reads inline)
-        (d_qk == 576) ? nullptr : (uint8_t*)kv_scales.data_ptr(),
-        (d_qk == 576) ? 0 : int64_stride_to_int(kv_scales.stride(0)),
-        (d_qk == 576) ? 0 : int64_stride_to_int(kv_scales.stride(1)),
+        // NVFP4: separate E4M3 scale pool for both V3.2 and MODEL1.
+        (uint8_t*)kv_scales.data_ptr(),
+        int64_stride_to_int(kv_scales.stride(0)),
+        int64_stride_to_int(kv_scales.stride(1)),
 
         int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)), int64_stride_to_int(q.stride(2)),
         int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
