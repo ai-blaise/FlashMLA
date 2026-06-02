@@ -614,7 +614,7 @@ KernelTemplate<MODEL_TYPE>
                             plan.u.kv.raw_nope[rs.raw_buf_idx].data() + NVFP4_SCORE_BYTES*row,  // NVFP4 packed score
                             0,
                             cur_indices,
-                            (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                            (int64_t)TMA::CacheHintSm90::EVICT_NORMAL
                         );
                         cur_indices = nxt_cur_indices;
                     }
