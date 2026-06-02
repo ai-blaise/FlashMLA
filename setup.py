@@ -67,6 +67,7 @@ ext_modules.append(
             # API
             "csrc/api/api.cpp",
             "csrc/api/sparse_decode_nvfp4.cu",
+            "csrc/sm100/decode/head64_nvfp4/q_prequant.cu",
 
             # Misc kernels for decoding
             "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",

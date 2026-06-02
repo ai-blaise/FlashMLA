@@ -4,6 +4,7 @@
 
 #include <cuda_fp8.h>
 #include <cutlass/barrier.h>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cute/tensor.hpp>
 
 #include <kerutils/kerutils.cuh>
@@ -17,6 +18,8 @@ using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using e8m0 = __nv_fp8_e8m0;
 using e4m3 = cutlass::float_e4m3_t;
+using e2m1 = cutlass::float_e2m1_t;
+using ue4m3 = cutlass::float_ue4m3_t;
 using namespace cute;
 
 enum NamedBarriers : uint32_t {
@@ -37,17 +40,32 @@ static constexpr int D_NOPE = MODEL_TYPE == ModelType::V32 ? 512 : 448;
 static constexpr int D_ROPE = 64;
 static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 16 : 16;  // NVFP4 block size
 static constexpr bool V_HAVE_ROPE = MODEL_TYPE == ModelType::V32 ? false : true;
-static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 32 : 32;    // NVFP4 block_size=16 -> 32 scales per token for D_NOPE=512 (V32) or 28 padded to 32 (MODEL1)
-// NVFP4 V32: D_NOPE/2 (=256) packed FP4 + 2*D_ROPE (=128 BF16) + NUM_SCALES (=32 E4M3)
-// = 416 B/token. Inline layout (scales follow rope per token), matching FP8 V32 architecture.
-// MODEL1: D_NOPE/2 (=224) + 2*D_ROPE (=128) + 32 scales = 384.
-static constexpr int TMA_K_STRIDE = MODEL_TYPE == ModelType::V32 ? (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
+static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 36 : 32;
+// V32 full-NVFP4 token layout: 576 packed FP4 score dims (288 B),
+// 36 E4M3 scales (one per 16 dims), then 12 B padding for 16 B alignment.
+// PV consumes only the first D_V=512 dequantized dims.
+static constexpr int NVFP4_SCORE_BYTES = MODEL_TYPE == ModelType::V32 ? D_Q / 2 : D_NOPE / 2;
+static constexpr int NVFP4_TOKEN_BYTES = MODEL_TYPE == ModelType::V32 ? 336 : (D_NOPE/2)+2*D_ROPE+NUM_SCALES_EACH_TOKEN;
+static constexpr int TMA_K_STRIDE = NVFP4_TOKEN_BYTES;
 static_assert(D_NOPE + D_ROPE == D_Q);
 static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
 
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 64;
+static constexpr int NVFP4_DUAL_QK_PACKED_BYTES = B_H * NVFP4_SCORE_BYTES * 2;
+static constexpr int NVFP4_DUAL_QK_SCALE_BYTES = B_TOPK * NUM_SCALES_EACH_TOKEN * 2;
+static constexpr int NVFP4_NATIVE_Q_PACKED_BYTES = NVFP4_DUAL_QK_PACKED_BYTES;
+static constexpr int NVFP4_NATIVE_Q_SCALE_BYTES = NVFP4_DUAL_QK_SCALE_BYTES;
+static constexpr int NVFP4_NATIVE_K_PACKED_BYTES = B_TOPK * NVFP4_SCORE_BYTES;
+static constexpr int NVFP4_NATIVE_K_SCALE_BYTES = NVFP4_DUAL_QK_SCALE_BYTES;
+static constexpr int NUM_NATIVE_INDEX_BUFS = 2;
 static constexpr int NUM_BUFS = 2;
+// raw_nope is double-buffered with NUM_BUFS in the canonical Phase 2 layout, but the
+// raw KV producer (warp 5) and the dequant warp are decoupled from the V dequant ring,
+// so we can give raw_nope a deeper pipeline of NUM_RAW_BUFS=3 without growing kv (kv is
+// dequant[NUM_BUFS]=144K + raw_nope[NUM_RAW_BUFS]=54K = 198K, still smaller than qo=202K
+// in the union, so the union size and SMEM total stay at the same 227K as NUM_BUFS=2).
+static constexpr int NUM_RAW_BUFS = 3;
 static constexpr int NUM_INDEX_BUFS = 3;  // NVFP4: reduced from 4 to fit SMEM (32 scales/token expands SMEM)
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
 static constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
@@ -159,6 +177,43 @@ using SmemLayoutKTilesTransposed_SW64 = decltype(composition(
     >{}
 ));
 
+struct NativeQKSharedMemoryPlan {
+    struct NativeMainloopScratch {
+        struct {
+            array_aligned<uint8_t, NVFP4_NATIVE_Q_PACKED_BYTES, 128> q;
+            CUTE_ALIGNAS(16) uint8_t scales[NVFP4_NATIVE_Q_SCALE_BYTES];
+        } q;
+        struct Buffer {
+            union {
+                struct {
+                    array_aligned<uint8_t, NVFP4_NATIVE_K_PACKED_BYTES, 128> k;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_NATIVE_K_SCALE_BYTES];
+                } native_k;
+                array_aligned<bf16, B_TOPK*D_V> v;
+            } decoded;
+            array_aligned<uint8_t, B_TOPK*NVFP4_SCORE_BYTES, 128> raw;
+        } kv[NUM_BUFS];
+    } mainloop;
+    union {
+        float4 p_exchange_buf[4][16 * B_TOPK / 4];
+        array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    } s_p;
+    CUTE_ALIGNAS(16) float rowwise_max_buf[128];
+    char is_token_valid[NUM_NATIVE_INDEX_BUFS][B_TOPK/8];
+    CUTE_ALIGNAS(16) int tma_coord[NUM_NATIVE_INDEX_BUFS][B_TOPK];
+    CUTE_ALIGNAS(16) e4m3 scales[NUM_NATIVE_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];
+    array_aligned<uint32_t, 1> tmem_start_addr;
+    transac_bar_t bar_last_store_done;
+    transac_bar_t bar_q_native_ready;
+    transac_bar_t bar_k_native_ready[NUM_BUFS];
+    transac_bar_t bar_v_ready[NUM_BUFS];
+    transac_bar_t bar_raw_ready[NUM_BUFS], bar_raw_free[NUM_BUFS];
+    transac_bar_t bar_valid_coord_scale_ready[NUM_NATIVE_INDEX_BUFS], bar_valid_coord_scale_free[NUM_NATIVE_INDEX_BUFS];
+    transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
+};
+static_assert(sizeof(NativeQKSharedMemoryPlan) < 232448,
+              "Native NVFP4 QK shared-memory plan must fit B200 opt-in SMEM");
+
 struct SharedMemoryPlan {
     union {
         struct {
@@ -167,16 +222,28 @@ struct SharedMemoryPlan {
             union {
                 array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
                 array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
+                struct {
+                    array_aligned<uint8_t, NVFP4_DUAL_QK_PACKED_BYTES> q;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_DUAL_QK_SCALE_BYTES];
+                } native_qk;
             } o;
         } qo;
         struct {
-            struct {
-                array_aligned<bf16, B_H*D_NOPE> nope; // NoPE part, dequantized
-                array_aligned<bf16, B_H*D_ROPE> rope; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
-            } dequant[NUM_BUFS];
+            union {
+                struct {
+                    array_aligned<bf16, B_H*D_NOPE> nope; // NoPE part, dequantized
+                    array_aligned<bf16, B_H*D_ROPE> rope; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
+                } dequant[NUM_BUFS];
+                struct {
+                    array_aligned<uint8_t, NVFP4_DUAL_QK_PACKED_BYTES> k;
+                    CUTE_ALIGNAS(16) uint8_t scales[NVFP4_DUAL_QK_SCALE_BYTES];
+                } native_qk[NUM_BUFS];
+            };
             static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not covers raw_nope
-            // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope
-            array_aligned<uint8_t, B_H*D_NOPE/2> raw_nope[NUM_BUFS];  // Raw FP4-packed NoPE
+            // NVFP4: packed e2m1, half the byte count vs FP8 raw_nope.
+            // Deeper pipelined than dequant: NUM_RAW_BUFS=3 lets the raw KV TMA producer
+            // run two blocks ahead of the WG2 dequant warp.
+            array_aligned<uint8_t, B_H*NVFP4_SCORE_BYTES> raw_nope[NUM_RAW_BUFS];  // Raw FP4-packed score dims
         } kv;
     } u;
     union {
@@ -192,7 +259,7 @@ struct SharedMemoryPlan {
     transac_bar_t bar_q_tma, bar_q_utccp;
     transac_bar_t bar_rope_ready[NUM_BUFS];
     transac_bar_t bar_nope_ready[NUM_BUFS];
-    transac_bar_t bar_raw_ready[NUM_BUFS], bar_raw_free[NUM_BUFS];
+    transac_bar_t bar_raw_ready[NUM_RAW_BUFS], bar_raw_free[NUM_RAW_BUFS];
     transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS], bar_valid_coord_scale_free[NUM_INDEX_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
 };
@@ -204,6 +271,45 @@ using TiledMMA_P = decltype(make_tiled_mma(
 using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{}
 ));
+
+static constexpr int NVFP4_SF_VEC = 16;
+static constexpr int NVFP4_QK_M = B_H * 2;
+static constexpr int NVFP4_QK_N = B_TOPK;
+static constexpr int NVFP4_QK_K = D_Q;
+
+using TiledMMA_QK_NVFP4 = decltype(make_tiled_mma(
+    SM100_MMA_MXF4_SS<
+        e2m1,
+        e2m1,
+        float,
+        ue4m3,
+        NVFP4_QK_M,
+        NVFP4_QK_N,
+        NVFP4_SF_VEC,
+        UMMA::Major::K,
+        UMMA::Major::K>{}
+));
+
+using TileShapeQKNVFP4 = Shape<Int<NVFP4_QK_M>, Int<NVFP4_QK_N>, Int<NVFP4_QK_K>>;
+using MmaShapeAQKNVFP4 = decltype(partition_shape_A(
+    TiledMMA_QK_NVFP4{}, Shape<Int<NVFP4_QK_M>, Int<NVFP4_QK_K>>{}));
+using MmaShapeBQKNVFP4 = decltype(partition_shape_B(
+    TiledMMA_QK_NVFP4{}, Shape<Int<NVFP4_QK_N>, Int<NVFP4_QK_K>>{}));
+
+using SmemLayoutQNVFP4 = decltype(UMMA::tile_to_mma_shape(
+    UMMA::Layout_K_SW32_Atom<e2m1>{},
+    append(MmaShapeAQKNVFP4{}, _1{}),
+    Step<_1, _2, _3>{}));
+using SmemLayoutKNVFP4 = decltype(UMMA::tile_to_mma_shape(
+    UMMA::Layout_K_SW32_Atom<e2m1>{},
+    append(MmaShapeBQKNVFP4{}, _1{}),
+    Step<_1, _2, _3>{}));
+
+using NVFP4QKScaleLayout = cutlass::detail::Sm1xxBlockScaledConfig<NVFP4_SF_VEC>;
+using SmemLayoutQScaleNVFP4 = decltype(
+    NVFP4QKScaleLayout::deduce_smem_layoutSFA(TiledMMA_QK_NVFP4{}, TileShapeQKNVFP4{}));
+using SmemLayoutKScaleNVFP4 = decltype(
+    NVFP4QKScaleLayout::deduce_smem_layoutSFB(TiledMMA_QK_NVFP4{}, TileShapeQKNVFP4{}));
 
 template<typename TmaParam>
 static __device__ void
