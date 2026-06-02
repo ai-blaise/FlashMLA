@@ -211,6 +211,69 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_sparse_fwd_nvfp4(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scales: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sparse MLA decode over a split-scale NVFP4 paged KV cache.
+
+    This is the production path for DeepSeek-V3.2-style MLA KV cache in
+    op-trt: packed NVFP4 data and E4M3 scale factors are stored in separate
+    pools by the runtime KV cache manager. The function intentionally has no
+    BF16/FP8 fallback; callers that request NVFP4 KV must provide both pools.
+
+    Args:
+        q: [s_q, h_q, d_qk] or [batch, s_q, h_q, d_qk], bfloat16.
+        kv: [num_pages, page_block_size, h_kv, 288], uint8 packed NVFP4.
+        kv_scales: [num_pages, page_block_size, h_kv, 36], uint8 E4M3 scales.
+        indices: [s_q, h_kv, topk] or [batch, s_q, topk], int32 page-token ids.
+        sm_scale: attention softmax scale.
+        d_v: value dimension, 512 for DeepSeek V3.2 MLA.
+    """
+    if q.dim() == 3:
+        q_in = q.unsqueeze(1)
+        squeeze_output = True
+    elif q.dim() == 4:
+        q_in = q
+        squeeze_output = False
+    else:
+        raise ValueError(f"q must be 3D or 4D, got shape {tuple(q.shape)}")
+
+    if indices.dim() == 2:
+        indices_in = indices.view(q_in.shape[0], q_in.shape[1], -1)
+    elif indices.dim() == 3:
+        indices_in = indices
+    else:
+        raise ValueError(
+            f"indices must be 2D or 3D, got shape {tuple(indices.shape)}")
+
+    if kv.dim() != 4 or kv_scales.dim() != 4:
+        raise ValueError(
+            "kv and kv_scales must be paged 4D tensors for NVFP4 sparse MLA")
+    if kv.shape[:3] != kv_scales.shape[:3]:
+        raise ValueError(
+            f"kv and kv_scales page/head shapes differ: {tuple(kv.shape)} vs {tuple(kv_scales.shape)}")
+    if kv.shape[-1] != 288 or kv_scales.shape[-1] != 36:
+        raise ValueError(
+            f"DeepSeek V3.2 NVFP4 MLA expects 288 data bytes and 36 scale bytes per token, got {kv.shape[-1]} and {kv_scales.shape[-1]}")
+
+    out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd_nvfp4(
+        q_in, kv, kv_scales, indices_in, topk_length, attn_sink,
+        tile_scheduler_metadata, num_splits, d_v, sm_scale)
+    if squeeze_output:
+        out = out.squeeze(1)
+        lse = lse.squeeze(1)
+    return out, lse, new_tile_scheduler_metadata, new_num_splits
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
